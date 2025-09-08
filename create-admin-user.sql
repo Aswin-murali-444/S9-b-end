@@ -67,3 +67,4 @@ WHERE u.email = 'admin@yourcompany.com';
 
 -- Step 4: Show all available roles
 SELECT unnest(enum_range(NULL::user_role)) as available_roles;
+

@@ -62,3 +62,4 @@ CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 
 -- Verify the change
 SELECT unnest(enum_range(NULL::user_role)) as available_roles;
+
