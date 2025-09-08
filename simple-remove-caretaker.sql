@@ -27,3 +27,4 @@ SELECT unnest(enum_range(NULL::user_role)) as current_roles;
 ALTER TABLE users 
 ADD CONSTRAINT check_valid_roles 
 CHECK (role IN ('customer', 'service_provider', 'supervisor', 'driver', 'admin'));
+
