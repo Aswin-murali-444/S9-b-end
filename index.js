@@ -280,7 +280,13 @@ app.post('/login', async (req, res) => {
     }
 
     // Get user by email
-    const user = await userService.getUserByEmail(email);
+    let user;
+    try {
+      user = await userService.getUserByEmail(email);
+    } catch (e) {
+      // Treat missing user or lookup errors as invalid credentials
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
     if (!user) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
@@ -289,6 +295,18 @@ app.post('/login', async (req, res) => {
     const password_hash = Buffer.from(password).toString('base64');
     if (user.password_hash !== password_hash) {
       return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Block login if user status is not active
+    if (user.status !== 'active') {
+      const reason = user.status === 'suspended'
+        ? 'Account is suspended'
+        : user.status === 'inactive'
+          ? 'Account is inactive'
+          : user.status === 'pending_verification'
+            ? 'Account pending verification'
+            : 'Account status does not allow login';
+      return res.status(403).json({ error: reason, status: user.status });
     }
 
     // Get dashboard route based on role
