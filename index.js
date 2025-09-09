@@ -12,16 +12,17 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-// Initialize Supabase client
+// Initialize Supabase client (prefer service role key if available)
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY
 );
 
 // Test Supabase connection on startup
 console.log('🔌 Initializing Supabase connection...');
 console.log('🔌 SUPABASE_URL:', process.env.SUPABASE_URL ? 'Set' : 'NOT SET');
 console.log('🔌 SUPABASE_ANON_KEY:', process.env.SUPABASE_ANON_KEY ? 'Set' : 'NOT SET');
+console.log('🔌 SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? 'Set' : 'NOT SET');
 
 // Test connection
 supabase.from('users').select('count').limit(1)
@@ -536,6 +537,236 @@ app.get('/check-email/:email', async (req, res) => {
       exists: false,
       message: 'Error checking email availability'
     });
+  }
+});
+
+// Service Categories
+// List categories
+app.get('/categories', async (req, res) => {
+  try {
+    console.log('📥 GET /categories');
+    const { data, error } = await supabase
+      .from('service_categories')
+      .select('id, name, description, icon_url, settings, active, created_at, updated_at')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('❌ Supabase error [GET /categories]:', error);
+      return res.status(500).json({ error: error.message || 'Failed to fetch categories' });
+    }
+    res.json(data);
+  } catch (error) {
+    console.error('💥 Unexpected error [GET /categories]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Create category (visual settings optional)
+app.post('/categories', async (req, res) => {
+  try {
+    const { name, description, active = true, iconUrl = null, settings = null, status } = req.body || {};
+    console.log('📥 POST /categories body:', req.body);
+
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: 'Category name is required' });
+    }
+    // Disallow digits in category name
+    const normalizedName = String(name).trim();
+    if (/\d/.test(normalizedName)) {
+      return res.status(400).json({ error: 'Numbers are not allowed in category name' });
+    }
+
+    // Validate status if provided
+    const allowedStatuses = ['active', 'inactive', 'suspended'];
+    let normalizedStatus = undefined;
+    if (typeof status === 'string') {
+      const s = status.toLowerCase().trim();
+      if (!allowedStatuses.includes(s)) {
+        return res.status(400).json({ error: 'Invalid status. Must be one of: active, inactive, suspended' });
+      }
+      normalizedStatus = s;
+    }
+
+    const payload = {
+      name: normalizedName,
+      description: description ?? null,
+      active: Boolean(active),
+      icon_url: iconUrl ?? null,
+      settings: settings ?? null,
+      ...(normalizedStatus ? { status: normalizedStatus } : {})
+    };
+    console.log('📝 Insert payload (service_categories):', payload);
+
+    const { data, error } = await supabase
+      .from('service_categories')
+      .insert(payload)
+      .select()
+      .single();
+
+    if (error) {
+      // Handle unique constraint violation on name (case-insensitive)
+      console.error('❌ Supabase error [POST /categories]:', error);
+      const message = (error.message || '').toLowerCase();
+      if (message.includes('duplicate') || message.includes('unique')) {
+        return res.status(409).json({ error: 'Category name already exists' });
+      }
+      if (error.code === '42501') {
+        return res.status(403).json({ error: 'Permission denied. Check RLS policies or use service role key.' });
+      }
+      return res.status(500).json({ error: message || 'Failed to create category' });
+    }
+
+    res.status(201).json(data);
+  } catch (error) {
+    console.error('💥 Unexpected error [POST /categories]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get a single category
+app.get('/categories/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('service_categories')
+      .select('id, name, description, icon_url, settings, active, created_at, updated_at')
+      .eq('id', id)
+      .single();
+    if (error) return res.status(404).json({ error: 'Category not found' });
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update a category
+app.put('/categories/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description, active, iconUrl, settings, status } = req.body || {};
+    const update = {};
+    if (typeof name === 'string') {
+      const trimmed = name.trim();
+      if (!trimmed) {
+        return res.status(400).json({ error: 'Category name cannot be empty' });
+      }
+      if (/\d/.test(trimmed)) {
+        return res.status(400).json({ error: 'Numbers are not allowed in category name' });
+      }
+      update.name = trimmed;
+    }
+    if (typeof description !== 'undefined') update.description = description;
+    if (typeof active !== 'undefined') update.active = Boolean(active);
+    if (typeof iconUrl !== 'undefined') update.icon_url = iconUrl;
+    if (typeof settings !== 'undefined') update.settings = settings;
+    if (typeof status === 'string') {
+      const s = status.toLowerCase().trim();
+      const allowed = ['active', 'inactive', 'suspended'];
+      if (!allowed.includes(s)) return res.status(400).json({ error: 'Invalid status' });
+      update.status = s;
+    }
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    const { data, error } = await supabase
+      .from('service_categories')
+      .update(update)
+      .eq('id', id)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Category not found' });
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Block (deactivate) a category
+app.patch('/categories/:id/block', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('service_categories')
+      .update({ active: false, status: 'suspended' })
+      .eq('id', id)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Category not found' });
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Unblock (activate) a category
+app.patch('/categories/:id/unblock', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('service_categories')
+      .update({ active: true, status: 'active' })
+      .eq('id', id)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Category not found' });
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Fallbacks for environments that don't support PATCH
+app.post('/categories/:id/block', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('service_categories')
+      .update({ active: false, status: 'suspended' })
+      .eq('id', id)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Category not found' });
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/categories/:id/unblock', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('service_categories')
+      .update({ active: true, status: 'active' })
+      .eq('id', id)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Category not found' });
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete a category (will fail if referenced by services due to FK)
+app.delete('/categories/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase
+      .from('service_categories')
+      .delete()
+      .eq('id', id);
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
