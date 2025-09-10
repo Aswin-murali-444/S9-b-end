@@ -5,18 +5,18 @@ const os = require('os');
 const { exec } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
 const UserService = require('./services/userService');
+const { supabase } = require('./lib/supabase');
+const categoriesRouter = require('./routes/categories');
+const usersRouter = require('./routes/users');
+const servicesRouter = require('./routes/services');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '6mb' }));
 
-// Initialize Supabase client (prefer service role key if available)
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY
-);
+// Supabase client initialized in lib/supabase
 
 // Test Supabase connection on startup
 console.log('🔌 Initializing Supabase connection...');
@@ -540,235 +540,75 @@ app.get('/check-email/:email', async (req, res) => {
   }
 });
 
-// Service Categories
-// List categories
-app.get('/categories', async (req, res) => {
+// Mount modular routers
+app.use('/categories', categoriesRouter);
+app.use('/users', usersRouter);
+app.use('/services', servicesRouter);
+
+// Upload user profile picture via backend (uses service role key)
+app.post('/users/profile-picture-upload', async (req, res) => {
   try {
-    console.log('📥 GET /categories');
-    const { data, error } = await supabase
-      .from('service_categories')
-      .select('id, name, description, icon_url, settings, active, created_at, updated_at')
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      console.error('❌ Supabase error [GET /categories]:', error);
-      return res.status(500).json({ error: error.message || 'Failed to fetch categories' });
+    const { fileName, fileType, base64, userId } = req.body || {};
+    if (!fileName || !fileType || !base64) {
+      return res.status(400).json({ error: 'fileName, fileType, base64 are required' });
     }
-    res.json(data);
-  } catch (error) {
-    console.error('💥 Unexpected error [GET /categories]:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Create category (visual settings optional)
-app.post('/categories', async (req, res) => {
-  try {
-    const { name, description, active = true, iconUrl = null, settings = null, status } = req.body || {};
-    console.log('📥 POST /categories body:', req.body);
-
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ error: 'Category name is required' });
-    }
-    // Disallow digits in category name
-    const normalizedName = String(name).trim();
-    if (/\d/.test(normalizedName)) {
-      return res.status(400).json({ error: 'Numbers are not allowed in category name' });
+    if (!String(fileType).toLowerCase().startsWith('image/')) {
+      return res.status(400).json({ error: 'Only image uploads are allowed' });
     }
 
-    // Validate status if provided
-    const allowedStatuses = ['active', 'inactive', 'suspended'];
-    let normalizedStatus = undefined;
-    if (typeof status === 'string') {
-      const s = status.toLowerCase().trim();
-      if (!allowedStatuses.includes(s)) {
-        return res.status(400).json({ error: 'Invalid status. Must be one of: active, inactive, suspended' });
+    const bucket = 'profile-pictures';
+    const ext = (String(fileName).split('.').pop() || 'png').toLowerCase();
+    const safeUser = (String(userId || '').trim() || 'anonymous')
+      .replace(/[^a-zA-Z0-9_-]/g, '')
+      .slice(0, 64) || 'anonymous';
+    const objectKey = `${safeUser}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+
+    if (process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      try {
+        const { data: bucketInfo, error: getBucketError } = await supabase.storage.getBucket(bucket);
+        if (getBucketError || !bucketInfo) {
+          await supabase.storage.createBucket(bucket, { public: true });
+        }
+        await supabase.storage.updateBucket(bucket, { public: true });
+      } catch (ensureError) {
+        console.warn('⚠️ Could not ensure profile-pictures bucket exists/public:', ensureError?.message || ensureError);
       }
-      normalizedStatus = s;
+    } else {
+      console.warn('⚠️ SUPABASE_SERVICE_ROLE_KEY is not set. Storage operations may be blocked by RLS.');
     }
 
-    const payload = {
-      name: normalizedName,
-      description: description ?? null,
-      active: Boolean(active),
-      icon_url: iconUrl ?? null,
-      settings: settings ?? null,
-      ...(normalizedStatus ? { status: normalizedStatus } : {})
-    };
-    console.log('📝 Insert payload (service_categories):', payload);
+    const buffer = Buffer.from(base64, 'base64');
+    const { error: uploadError } = await supabase
+      .storage
+      .from(bucket)
+      .upload(objectKey, buffer, { contentType: fileType, upsert: true, cacheControl: '3600' });
 
-    const { data, error } = await supabase
-      .from('service_categories')
-      .insert(payload)
-      .select()
-      .single();
-
-    if (error) {
-      // Handle unique constraint violation on name (case-insensitive)
-      console.error('❌ Supabase error [POST /categories]:', error);
-      const message = (error.message || '').toLowerCase();
-      if (message.includes('duplicate') || message.includes('unique')) {
-        return res.status(409).json({ error: 'Category name already exists' });
+    if (uploadError) {
+      const msg = (uploadError.message || '').toLowerCase();
+      if (msg.includes('row-level security') || msg.includes('violates row-level security') || uploadError.statusCode === 401 || uploadError.statusCode === 403) {
+        return res.status(403).json({ error: 'Permission denied by storage policies. Ensure service role key is configured and bucket policies allow upload.' });
       }
-      if (error.code === '42501') {
-        return res.status(403).json({ error: 'Permission denied. Check RLS policies or use service role key.' });
-      }
-      return res.status(500).json({ error: message || 'Failed to create category' });
+      console.error('❌ Profile picture upload failed:', uploadError);
+      return res.status(500).json({ error: uploadError.message || 'Upload failed' });
     }
 
-    res.status(201).json(data);
-  } catch (error) {
-    console.error('💥 Unexpected error [POST /categories]:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+    let publicUrl = null;
+    try {
+      const { data: publicData } = supabase.storage.from(bucket).getPublicUrl(objectKey);
+      publicUrl = publicData?.publicUrl || null;
+    } catch (_) {}
 
-// Get a single category
-app.get('/categories/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { data, error } = await supabase
-      .from('service_categories')
-      .select('id, name, description, icon_url, settings, active, created_at, updated_at')
-      .eq('id', id)
-      .single();
-    if (error) return res.status(404).json({ error: 'Category not found' });
-    res.json(data);
+    return res.json({ path: `${bucket}/${objectKey}`, publicUrl });
   } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Update a category
-app.put('/categories/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, description, active, iconUrl, settings, status } = req.body || {};
-    const update = {};
-    if (typeof name === 'string') {
-      const trimmed = name.trim();
-      if (!trimmed) {
-        return res.status(400).json({ error: 'Category name cannot be empty' });
-      }
-      if (/\d/.test(trimmed)) {
-        return res.status(400).json({ error: 'Numbers are not allowed in category name' });
-      }
-      update.name = trimmed;
+    console.error('💥 Unexpected error [POST /users/profile-picture-upload]:', error);
+    const message = String(error?.message || '').toLowerCase();
+    if (message.includes('row-level security') || message.includes('violates row-level security')) {
+      return res.status(403).json({ error: 'Permission denied by storage policies. Configure RLS or use service role key.' });
     }
-    if (typeof description !== 'undefined') update.description = description;
-    if (typeof active !== 'undefined') update.active = Boolean(active);
-    if (typeof iconUrl !== 'undefined') update.icon_url = iconUrl;
-    if (typeof settings !== 'undefined') update.settings = settings;
-    if (typeof status === 'string') {
-      const s = status.toLowerCase().trim();
-      const allowed = ['active', 'inactive', 'suspended'];
-      if (!allowed.includes(s)) return res.status(400).json({ error: 'Invalid status' });
-      update.status = s;
-    }
-    if (Object.keys(update).length === 0) {
-      return res.status(400).json({ error: 'No fields to update' });
-    }
-    const { data, error } = await supabase
-      .from('service_categories')
-      .update(update)
-      .eq('id', id)
-      .select()
-      .single();
-    if (error) return res.status(500).json({ error: error.message });
-    if (!data) return res.status(404).json({ error: 'Category not found' });
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message || 'Upload error' });
   }
 });
 
-// Block (deactivate) a category
-app.patch('/categories/:id/block', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { data, error } = await supabase
-      .from('service_categories')
-      .update({ active: false, status: 'suspended' })
-      .eq('id', id)
-      .select()
-      .single();
-    if (error) return res.status(500).json({ error: error.message });
-    if (!data) return res.status(404).json({ error: 'Category not found' });
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Unblock (activate) a category
-app.patch('/categories/:id/unblock', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { data, error } = await supabase
-      .from('service_categories')
-      .update({ active: true, status: 'active' })
-      .eq('id', id)
-      .select()
-      .single();
-    if (error) return res.status(500).json({ error: error.message });
-    if (!data) return res.status(404).json({ error: 'Category not found' });
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Fallbacks for environments that don't support PATCH
-app.post('/categories/:id/block', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { data, error } = await supabase
-      .from('service_categories')
-      .update({ active: false, status: 'suspended' })
-      .eq('id', id)
-      .select()
-      .single();
-    if (error) return res.status(500).json({ error: error.message });
-    if (!data) return res.status(404).json({ error: 'Category not found' });
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/categories/:id/unblock', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { data, error } = await supabase
-      .from('service_categories')
-      .update({ active: true, status: 'active' })
-      .eq('id', id)
-      .select()
-      .single();
-    if (error) return res.status(500).json({ error: error.message });
-    if (!data) return res.status(404).json({ error: 'Category not found' });
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Delete a category (will fail if referenced by services due to FK)
-app.delete('/categories/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { error } = await supabase
-      .from('service_categories')
-      .delete()
-      .eq('id', id);
-    if (error) {
-      return res.status(500).json({ error: error.message });
-    }
-    res.status(204).send();
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
