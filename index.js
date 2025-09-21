@@ -1,22 +1,37 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const os = require('os');
-const { exec } = require('child_process');
-const { createClient } = require('@supabase/supabase-js');
-const UserService = require('./services/userService');
 const { supabase } = require('./lib/supabase');
+
+// Import route modules
 const categoriesRouter = require('./routes/categories');
 const usersRouter = require('./routes/users');
 const servicesRouter = require('./routes/services');
 
+// Import middleware modules
+const { getSystemMetrics } = require('./middleware/systemMetrics');
+const { testDatabase } = require('./middleware/dbTest');
+const { registerUser, loginUser, checkEmail } = require('./middleware/auth');
+const { 
+  getAllUsers, 
+  getUserProfile, 
+  updateUserProfile, 
+  updateRoleDetails,
+  getUsersByRole,
+  getUsersByStatus,
+  updateUserStatus,
+  verifyUserEmail,
+  getUserStats,
+  getDashboardRoute
+} = require('./middleware/userManagement');
+const { uploadProfilePicture } = require('./middleware/profileUpload');
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Middleware
 app.use(cors());
 app.use(express.json({ limit: '6mb' }));
-
-// Supabase client initialized in lib/supabase
 
 // Test Supabase connection on startup
 console.log('🔌 Initializing Supabase connection...');
@@ -38,577 +53,41 @@ supabase.from('users').select('count').limit(1)
     console.error('💥 Supabase connection error:', err.message);
   });
 
-// Initialize User Service
-const userService = new UserService();
-
+// Basic routes
 app.get('/', (req, res) => {
   res.send('API is running 🚀');
 });
 
-// Utilities to compute real-time system metrics
-const cpuTimesSnapshot = () => {
-  const cpus = os.cpus();
-  let idle = 0;
-  let total = 0;
-  for (const cpu of cpus) {
-    const times = cpu.times;
-    idle += times.idle;
-    total += times.user + times.nice + times.sys + times.idle + times.irq;
-  }
-  return { idle, total };
-};
+// System metrics
+app.get('/system/metrics', getSystemMetrics);
 
-const getCpuUsagePercent = async (sampleMs = 200) => {
-  const start = cpuTimesSnapshot();
-  await new Promise(r => setTimeout(r, sampleMs));
-  const end = cpuTimesSnapshot();
-  const idleDiff = end.idle - start.idle;
-  const totalDiff = end.total - start.total;
-  const usage = totalDiff > 0 ? (1 - idleDiff / totalDiff) * 100 : 0;
-  return Math.round(usage);
-};
+// Database testing
+app.get('/test-db', testDatabase);
 
-const getDiskUsagePercent = () => new Promise((resolve) => {
-  try {
-    if (process.platform === 'win32') {
-      // Fixed drives only (DriveType=3)
-      exec('wmic logicaldisk where DriveType=3 get Size,FreeSpace,DeviceID /format:csv', (err, stdout) => {
-        if (err || !stdout) return resolve(null);
-        const lines = stdout.trim().split(/\r?\n/).slice(1); // skip header
-        let total = 0;
-        let free = 0;
-        for (const line of lines) {
-          const parts = line.split(',');
-          // CSV format: Node,DeviceID,FreeSpace,Size
-          if (parts.length >= 4) {
-            const freeSpace = Number(parts[2]);
-            const size = Number(parts[3]);
-            if (!isNaN(size) && size > 0 && !isNaN(freeSpace)) {
-              total += size;
-              free += freeSpace;
-            }
-          }
-        }
-        if (total > 0) {
-          const used = total - free;
-          resolve(Math.round((used / total) * 100));
-        } else {
-          resolve(null);
-        }
-      });
-    } else {
-      // Use df for Unix-like systems
-      exec('df -kP /', (err, stdout) => {
-        if (err || !stdout) return resolve(null);
-        const lines = stdout.trim().split(/\r?\n/);
-        if (lines.length < 2) return resolve(null);
-        const cols = lines[1].split(/\s+/);
-        // Expected: Filesystem 1024-blocks Used Available Capacity Mounted on
-        const used = Number(cols[2]);
-        const total = Number(cols[1]);
-        if (!isNaN(used) && !isNaN(total) && total > 0) {
-          resolve(Math.round((used / total) * 100));
-        } else {
-          resolve(null);
-        }
-      });
-    }
-  } catch (e) {
-    resolve(null);
-  }
-});
+// Authentication routes
+app.post('/register', registerUser);
+app.post('/login', loginUser);
+app.get('/check-email/:email', checkEmail);
 
-// Real-time system metrics endpoint
-app.get('/system/metrics', async (req, res) => {
-  try {
-    const [cpuUsage, diskUsage] = await Promise.all([
-      getCpuUsagePercent(200),
-      getDiskUsagePercent(),
-    ]);
+// User management routes
+app.get('/users', getAllUsers);
+app.get('/profile/:userId', getUserProfile);
+app.put('/profile/:userId', updateUserProfile);
+app.put('/profile/:userId/role-details', updateRoleDetails);
+app.get('/users/role/:role', getUsersByRole);
+app.get('/users/status/:status', getUsersByStatus);
+app.put('/users/:userId/status', updateUserStatus);
+app.put('/users/:userId/verify-email', verifyUserEmail);
+app.get('/users/stats', getUserStats);
+app.get('/dashboard-route/:userId', getDashboardRoute);
 
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-    const usedMem = totalMem - freeMem;
-    const memoryUsagePercent = Math.round((usedMem / totalMem) * 100);
-
-    res.json({
-      serverTime: Date.now(),
-      uptimeSec: Math.round(process.uptime()),
-      cpu: {
-        usagePercent: isNaN(cpuUsage) ? null : cpuUsage,
-      },
-      memory: {
-        totalBytes: totalMem,
-        usedBytes: usedMem,
-        freeBytes: freeMem,
-        usagePercent: memoryUsagePercent,
-      },
-      disk: diskUsage == null ? null : { usagePercent: diskUsage },
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Test endpoint to check database connection and table structure
-app.get('/test-db', async (req, res) => {
-  try {
-    console.log('🧪 Testing database connection...');
-    console.log('🧪 SUPABASE_URL:', process.env.SUPABASE_URL);
-    console.log('🧪 SUPABASE_ANON_KEY (first 20 chars):', process.env.SUPABASE_ANON_KEY ? process.env.SUPABASE_ANON_KEY.substring(0, 20) + '...' : 'NOT SET');
-    
-    // Test 1: Check if we can connect to Supabase
-    const { data: testData, error: testError } = await supabase
-      .from('users')
-      .select('count')
-      .limit(1);
-    
-    console.log('🔍 Test 1 - Connection test:', { testData, testError });
-    
-    // Test 2: Try to get table info (simplified)
-    console.log('🔍 Test 2 - Table info: RPC not available, skipping');
-    const tableInfo = null;
-    const tableError = 'RPC not available';
-    
-    // Test 3: Try to select from users table
-    const { data: users, error: usersError } = await supabase
-      .from('users')
-      .select('*')
-      .limit(10);
-    
-    console.log('🔍 Test 3 - Users table test:', { 
-      usersCount: users ? users.length : 0, 
-      usersError,
-      sampleUser: users && users.length > 0 ? users[0] : null,
-      allUsers: users
-    });
-    
-    // Test 4: Check if we can see the specific email
-    const { data: specificUser, error: specificError } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', 'aswinmurali444@gmail.com');
-    
-    console.log('🔍 Test 4 - Specific email test:', { 
-      specificUser, 
-      specificError,
-      found: specificUser && specificUser.length > 0
-    });
-    
-    res.json({
-      connection: !testError ? 'OK' : 'FAILED',
-      supabaseUrl: process.env.SUPABASE_URL,
-      tableInfo: tableInfo || 'Not available',
-      usersCount: users ? users.length : 0,
-      sampleUser: users && users.length > 0 ? users[0] : null,
-      specificEmailFound: specificUser && specificUser.length > 0,
-      allUsers: users,
-      errors: {
-        test: testError,
-        table: tableError,
-        users: usersError,
-        specific: specificError
-      }
-    });
-  } catch (error) {
-    console.error('💥 Test endpoint error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get all users
-app.get('/users', async (req, res) => {
-  try {
-    const users = await userService.getAllUsers();
-    res.json(users);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// User Registration Endpoint with Role
-app.post('/register', async (req, res) => {
-  try {
-    const { email, password, role, first_name, last_name, phone } = req.body;
-    
-    if (!email || !password || !role || !first_name || !last_name) {
-      return res.status(400).json({ 
-        error: 'Email, password, role, first_name, and last_name are required.' 
-      });
-    }
-
-    // Validate role
-    const validRoles = ['customer', 'service_provider', 'supervisor', 'driver', 'admin'];
-    if (!validRoles.includes(role)) {
-      return res.status(400).json({ 
-        error: 'Invalid role. Must be one of: customer, service_provider, supervisor, driver, admin' 
-      });
-    }
-
-    // Hash password (in production, use bcrypt)
-    const password_hash = Buffer.from(password).toString('base64'); // Simple encoding for demo
-
-    // Create user using service
-    const user = await userService.createUser({
-      email,
-      password_hash,
-      role,
-      first_name,
-      last_name,
-      phone
-    });
-
-    res.status(201).json({ 
-      message: 'User created successfully',
-      user: {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        status: user.status
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// User Login Endpoint
-app.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required.' });
-    }
-
-    // Get user by email
-    let user;
-    try {
-      user = await userService.getUserByEmail(email);
-    } catch (e) {
-      // Treat missing user or lookup errors as invalid credentials
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    // Simple password check (in production, use bcrypt.compare)
-    const password_hash = Buffer.from(password).toString('base64');
-    if (user.password_hash !== password_hash) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    // Block login if user status is not active
-    if (user.status !== 'active') {
-      const reason = user.status === 'suspended'
-        ? 'Account is suspended'
-        : user.status === 'inactive'
-          ? 'Account is inactive'
-          : user.status === 'pending_verification'
-            ? 'Account pending verification'
-            : 'Account status does not allow login';
-      return res.status(403).json({ error: reason, status: user.status });
-    }
-
-    // Get dashboard route based on role
-    const dashboardRoute = userService.getDashboardRoute(user.role);
-
-    res.json({ 
-      user: {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        status: user.status
-      },
-      dashboardRoute
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get User Profile with Role Details
-app.get('/profile/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const userData = await userService.getUserById(userId);
-    
-    // Get dashboard route
-    const dashboardRoute = userService.getDashboardRoute(userData.role);
-    
-    res.json({
-      ...userData,
-      dashboardRoute
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Update User Profile
-app.put('/profile/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const profileData = req.body;
-    
-    const result = await userService.updateUserProfile(userId, profileData);
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Update Role-Specific Details
-app.put('/profile/:userId/role-details', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { role, details } = req.body;
-    
-    if (!role || !details) {
-      return res.status(400).json({ error: 'Role and details are required' });
-    }
-
-    const result = await userService.updateRoleDetails(userId, role, details);
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get Users by Role
-app.get('/users/role/:role', async (req, res) => {
-  try {
-    const { role } = req.params;
-    const users = await userService.getUsersByRole(role);
-    res.json(users);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get Users by Status
-app.get('/users/status/:status', async (req, res) => {
-  try {
-    const { status } = req.params;
-    const { data, error } = await supabase
-      .from('users')
-      .select(`
-        *,
-        user_profiles (*)
-      `)
-      .eq('status', status);
-    
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Update User Status
-app.put('/users/:userId/status', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { status } = req.body;
-    
-    if (!status) {
-      return res.status(400).json({ error: 'Status is required' });
-    }
-
-    const result = await userService.updateUserStatus(userId, status);
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Verify User Email
-app.put('/users/:userId/verify-email', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const result = await userService.verifyUserEmail(userId);
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get User Statistics
-app.get('/users/stats', async (req, res) => {
-  try {
-    const stats = await userService.getUserStats();
-    res.json(stats);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get Dashboard Route for User
-app.get('/dashboard-route/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const user = await userService.getUserById(userId);
-    const dashboardRoute = userService.getDashboardRoute(user.role);
-    
-    res.json({ dashboardRoute });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Check if email exists
-app.get('/check-email/:email', async (req, res) => {
-  try {
-    const { email } = req.params;
-    
-    console.log('🔍 Backend: Email check request for:', email);
-    
-    if (!email) {
-      console.log('❌ Backend: No email parameter provided');
-      return res.status(400).json({ 
-        error: 'Email parameter is required',
-        exists: false,
-        message: 'Email parameter is required'
-      });
-    }
-
-    // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      console.log('❌ Backend: Invalid email format:', email);
-      return res.status(400).json({ 
-        error: 'Invalid email format',
-        exists: false,
-        message: 'Invalid email format'
-      });
-    }
-
-    // Normalize email (lowercase and trim)
-    const normalizedEmail = email.toLowerCase().trim();
-    
-    // Check if user exists in the users table
-    const { data: users, error: userError } = await supabase
-      .from('users')
-      .select('id, email, role, status, supabase_auth, auth_user_id')
-      .eq('email', normalizedEmail);
-    
-    if (userError) {
-      console.error('❌ Backend: Database error:', userError);
-      return res.status(500).json({ 
-        error: 'Database error checking email',
-        exists: false,
-        message: 'Error checking email availability'
-      });
-    }
-    
-    // Check if any users were found
-    const userExists = users && users.length > 0;
-    const existingUser = userExists ? users[0] : null;
-    
-    console.log('✅ Backend: Email check result:', {
-      email: normalizedEmail,
-      exists: userExists,
-      message: userExists ? 'Email already registered' : 'Email available',
-      usersFound: users ? users.length : 0,
-      existingUser: existingUser ? {
-        id: existingUser.id,
-        role: existingUser.role,
-        status: existingUser.status,
-        supabase_auth: existingUser.supabase_auth,
-        auth_user_id: existingUser.auth_user_id
-      } : null
-    });
-    
-    if (userExists) {
-      res.json({ 
-        exists: true,
-        message: 'Email already registered'
-      });
-    } else {
-      res.json({ 
-        exists: false,
-        message: 'Email available'
-      });
-    }
-  } catch (error) {
-    console.error('💥 Backend: Unexpected error:', error);
-    res.status(500).json({ 
-      error: 'Unexpected error checking email availability',
-      exists: false,
-      message: 'Error checking email availability'
-    });
-  }
-});
+// Profile picture upload
+app.post('/users/profile-picture-upload', uploadProfilePicture);
 
 // Mount modular routers
 app.use('/categories', categoriesRouter);
 app.use('/users', usersRouter);
 app.use('/services', servicesRouter);
-
-// Upload user profile picture via backend (uses service role key)
-app.post('/users/profile-picture-upload', async (req, res) => {
-  try {
-    const { fileName, fileType, base64, userId } = req.body || {};
-    if (!fileName || !fileType || !base64) {
-      return res.status(400).json({ error: 'fileName, fileType, base64 are required' });
-    }
-    if (!String(fileType).toLowerCase().startsWith('image/')) {
-      return res.status(400).json({ error: 'Only image uploads are allowed' });
-    }
-
-    const bucket = 'profile-pictures';
-    const ext = (String(fileName).split('.').pop() || 'png').toLowerCase();
-    const safeUser = (String(userId || '').trim() || 'anonymous')
-      .replace(/[^a-zA-Z0-9_-]/g, '')
-      .slice(0, 64) || 'anonymous';
-    const objectKey = `${safeUser}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-
-    if (process.env.SUPABASE_SERVICE_ROLE_KEY) {
-      try {
-        const { data: bucketInfo, error: getBucketError } = await supabase.storage.getBucket(bucket);
-        if (getBucketError || !bucketInfo) {
-          await supabase.storage.createBucket(bucket, { public: true });
-        }
-        await supabase.storage.updateBucket(bucket, { public: true });
-      } catch (ensureError) {
-        console.warn('⚠️ Could not ensure profile-pictures bucket exists/public:', ensureError?.message || ensureError);
-      }
-    } else {
-      console.warn('⚠️ SUPABASE_SERVICE_ROLE_KEY is not set. Storage operations may be blocked by RLS.');
-    }
-
-    const buffer = Buffer.from(base64, 'base64');
-    const { error: uploadError } = await supabase
-      .storage
-      .from(bucket)
-      .upload(objectKey, buffer, { contentType: fileType, upsert: true, cacheControl: '3600' });
-
-    if (uploadError) {
-      const msg = (uploadError.message || '').toLowerCase();
-      if (msg.includes('row-level security') || msg.includes('violates row-level security') || uploadError.statusCode === 401 || uploadError.statusCode === 403) {
-        return res.status(403).json({ error: 'Permission denied by storage policies. Ensure service role key is configured and bucket policies allow upload.' });
-      }
-      console.error('❌ Profile picture upload failed:', uploadError);
-      return res.status(500).json({ error: uploadError.message || 'Upload failed' });
-    }
-
-    let publicUrl = null;
-    try {
-      const { data: publicData } = supabase.storage.from(bucket).getPublicUrl(objectKey);
-      publicUrl = publicData?.publicUrl || null;
-    } catch (_) {}
-
-    return res.json({ path: `${bucket}/${objectKey}`, publicUrl });
-  } catch (error) {
-    console.error('💥 Unexpected error [POST /users/profile-picture-upload]:', error);
-    const message = String(error?.message || '').toLowerCase();
-    if (message.includes('row-level security') || message.includes('violates row-level security')) {
-      return res.status(403).json({ error: 'Permission denied by storage policies. Configure RLS or use service role key.' });
-    }
-    res.status(500).json({ error: error.message || 'Upload error' });
-  }
-});
-
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
