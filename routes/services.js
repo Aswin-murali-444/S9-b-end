@@ -13,6 +13,10 @@ router.get('/', async (req, res) => {
         description, 
         icon_url,
         duration, 
+        price,
+        offer_price,
+        offer_percentage,
+        offer_enabled,
         active, 
         created_at, 
         updated_at,
@@ -38,10 +42,53 @@ router.get('/', async (req, res) => {
   }
 });
 
+// Check service name availability
+router.post('/check-name', async (req, res) => {
+  try {
+    const { name, categoryId, excludeId } = req.body || {};
+    
+    if (!name || !categoryId) {
+      return res.status(400).json({ error: 'Name and category ID are required' });
+    }
+
+    const normalizedName = String(name).trim();
+    
+    // Check if service name exists in the same category
+    let query = supabase
+      .from('services')
+      .select('id, name')
+      .eq('category_id', categoryId)
+      .ilike('name', normalizedName);
+    
+    // Exclude current service when editing
+    if (excludeId) {
+      query = query.neq('id', excludeId);
+    }
+    
+    const { data: existingService, error } = await query.single();
+    
+    if (error && error.code !== 'PGRST116') { // PGRST116 = no rows found
+      return res.status(500).json({ error: 'Database error' });
+    }
+    
+    const isAvailable = !existingService;
+    
+    res.json({ 
+      available: isAvailable,
+      message: isAvailable ? 'Service name is available' : 'Service name already exists in this category'
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Create service
 router.post('/', async (req, res) => {
   try {
-    const { categoryId, name, description, iconBase64, iconFileName, iconMimeType, duration, active = true } = req.body || {};
+    const { categoryId, name, description, iconBase64, iconFileName, iconMimeType, duration, price, offerPrice, offerPercentage, offerEnabled, active = true } = req.body || {};
+    
+    console.log('Received service data:', { categoryId, name, duration, price, offerPrice, offerPercentage, offerEnabled });
     
     if (!categoryId || !name || !String(name).trim()) {
       return res.status(400).json({ error: 'Category ID and service name are required' });
@@ -111,8 +158,14 @@ router.post('/', async (req, res) => {
       description: description || null,
       icon_url: iconUrl,
       duration: duration || null,
+      price: price ? parseFloat(price) : null,
+      offer_price: offerPrice ? parseFloat(offerPrice) : null,
+      offer_percentage: offerPercentage ? parseFloat(offerPercentage) : null,
+      offer_enabled: Boolean(offerEnabled),
       active: Boolean(active)
     };
+    
+    console.log('Creating service with payload:', payload);
 
     const { data, error } = await supabase
       .from('services')
@@ -123,6 +176,10 @@ router.post('/', async (req, res) => {
         description, 
         icon_url,
         duration, 
+        price,
+        offer_price,
+        offer_percentage,
+        offer_enabled,
         active, 
         created_at, 
         updated_at,
@@ -132,6 +189,8 @@ router.post('/', async (req, res) => {
         )
       `)
       .single();
+    
+    console.log('Database insert result:', { data, error });
     
     if (error) {
       const message = (error.message || '').toLowerCase();
@@ -169,6 +228,10 @@ router.get('/:id', async (req, res) => {
         description, 
         icon_url,
         duration, 
+        price,
+        offer_price,
+        offer_percentage,
+        offer_enabled,
         active, 
         created_at, 
         updated_at,
@@ -199,7 +262,7 @@ router.get('/:id', async (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { categoryId, name, description, iconBase64, iconFileName, iconMimeType, duration, active } = req.body || {};
+    const { categoryId, name, description, iconBase64, iconFileName, iconMimeType, duration, price, offerPrice, offerPercentage, offerEnabled, active } = req.body || {};
     
     const update = {};
     
@@ -225,6 +288,10 @@ router.put('/:id', async (req, res) => {
     
     if (typeof description !== 'undefined') update.description = description;
     if (typeof duration !== 'undefined') update.duration = duration;
+    if (typeof price !== 'undefined') update.price = price ? parseFloat(price) : null;
+    if (typeof offerPrice !== 'undefined') update.offer_price = offerPrice ? parseFloat(offerPrice) : null;
+    if (typeof offerPercentage !== 'undefined') update.offer_percentage = offerPercentage ? parseFloat(offerPercentage) : null;
+    if (typeof offerEnabled !== 'undefined') update.offer_enabled = Boolean(offerEnabled);
     if (typeof active !== 'undefined') update.active = Boolean(active);
     
     // Handle icon upload to Supabase Storage
@@ -271,6 +338,10 @@ router.put('/:id', async (req, res) => {
         description, 
         icon_url,
         duration, 
+        price,
+        offer_price,
+        offer_percentage,
+        offer_enabled,
         active, 
         created_at, 
         updated_at,
@@ -311,6 +382,10 @@ router.patch('/:id/block', async (req, res) => {
         description, 
         icon_url,
         duration, 
+        price,
+        offer_price,
+        offer_percentage,
+        offer_enabled,
         active, 
         created_at, 
         updated_at,
@@ -351,6 +426,10 @@ router.patch('/:id/unblock', async (req, res) => {
         description, 
         icon_url,
         duration, 
+        price,
+        offer_price,
+        offer_percentage,
+        offer_enabled,
         active, 
         created_at, 
         updated_at,
@@ -391,6 +470,10 @@ router.post('/:id/block', async (req, res) => {
         description, 
         icon_url,
         duration, 
+        price,
+        offer_price,
+        offer_percentage,
+        offer_enabled,
         active, 
         created_at, 
         updated_at,
@@ -430,6 +513,10 @@ router.post('/:id/unblock', async (req, res) => {
         description, 
         icon_url,
         duration, 
+        price,
+        offer_price,
+        offer_percentage,
+        offer_enabled,
         active, 
         created_at, 
         updated_at,

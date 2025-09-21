@@ -9,6 +9,10 @@ CREATE TABLE IF NOT EXISTS services (
   description TEXT,
   icon_url TEXT, -- Service icon/image URL
   duration TEXT, -- Estimated duration (e.g., '1-2 hours', '30 minutes')
+  price DECIMAL(10,0), -- Service price in Indian Rupees
+  offer_price DECIMAL(10,0), -- Special offer price in Indian Rupees (optional)
+  offer_percentage DECIMAL(5,2), -- Offer percentage (e.g., 20.00 for 20%)
+  offer_enabled BOOLEAN DEFAULT FALSE, -- Whether the offer is active
   active BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
