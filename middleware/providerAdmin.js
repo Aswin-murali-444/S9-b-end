@@ -12,7 +12,7 @@ function generateTempPassword() {
 }
 
 function buildCredentialsEmailHtml({ appName = 'Nexus', fullName = 'Service Provider', email, password, loginUrl }) {
-  const safeLogin = loginUrl || process.env.FRONTEND_URL || 'http://localhost:5173';
+  const safeLogin = (loginUrl || process.env.FRONTEND_URL || 'http://localhost:5173') + '/';
   return `<!DOCTYPE html>
   <html lang="en">
   <head>
