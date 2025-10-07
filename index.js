@@ -25,6 +25,7 @@ const {
   getDashboardRoute
 } = require('./middleware/userManagement');
 const { uploadProfilePicture } = require('./middleware/profileUpload');
+const { createServiceProvider, updateServiceProviderDetails, listServiceProviders } = require('./middleware/providerAdmin');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -83,6 +84,16 @@ app.get('/dashboard-route/:userId', getDashboardRoute);
 
 // Profile picture upload
 app.post('/users/profile-picture-upload', uploadProfilePicture);
+
+// Provider admin endpoints
+app.post('/admin/providers', createServiceProvider);
+app.put('/admin/providers/:userId', updateServiceProviderDetails);
+app.get('/admin/providers', listServiceProviders);
+
+// Optional: Mirror under /api for dev proxies that expect /api prefix
+app.post('/api/admin/providers', createServiceProvider);
+app.put('/api/admin/providers/:userId', updateServiceProviderDetails);
+app.get('/api/admin/providers', listServiceProviders);
 
 // Mount modular routers
 app.use('/categories', categoriesRouter);
