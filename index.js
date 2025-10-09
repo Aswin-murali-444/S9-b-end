@@ -7,6 +7,8 @@ const { supabase } = require('./lib/supabase');
 const categoriesRouter = require('./routes/categories');
 const usersRouter = require('./routes/users');
 const servicesRouter = require('./routes/services');
+const bookingsRouter = require('./routes/bookings');
+const paymentsRouter = require('./routes/payments');
 
 // Import middleware modules
 const { getSystemMetrics } = require('./middleware/systemMetrics');
@@ -99,6 +101,12 @@ app.get('/api/admin/providers', listServiceProviders);
 app.use('/categories', categoriesRouter);
 app.use('/users', usersRouter);
 app.use('/services', servicesRouter);
+app.use('/bookings', bookingsRouter);
+app.use('/payments', paymentsRouter);
+
+// Optional mirrors for dev proxies expecting /api prefix
+app.use('/api/bookings', bookingsRouter);
+app.use('/api/payments', paymentsRouter);
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
