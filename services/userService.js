@@ -47,7 +47,54 @@ class UserService {
             .select('*')
             .eq('id', userId)
             .single();
-          roleDetails = providerData;
+
+          // Enrich with readable names for category and service
+          if (providerData) {
+            let serviceCategoryName = null;
+            let serviceName = null;
+            // Also read normalized experience from provider_profile_view where years_of_experience
+            // comes from provider_profiles (preferred over service_provider_details)
+            let normalizedExperienceYears = providerData?.experience_years ?? 0;
+            try {
+              const { data: profileView } = await this.supabase
+                .from('provider_profile_view')
+                .select('years_of_experience, spd_experience_years')
+                .eq('provider_id', userId)
+                .single();
+              if (profileView) {
+                normalizedExperienceYears = (profileView.years_of_experience ?? profileView.spd_experience_years ?? normalizedExperienceYears);
+              }
+            } catch (_) {}
+            try {
+              if (providerData.service_category_id) {
+                const { data: cat } = await this.supabase
+                  .from('service_categories')
+                  .select('id,name')
+                  .eq('id', providerData.service_category_id)
+                  .single();
+                serviceCategoryName = cat?.name || null;
+              }
+            } catch (_) {}
+            try {
+              if (providerData.service_id) {
+                const { data: svc } = await this.supabase
+                  .from('services')
+                  .select('id,name')
+                  .eq('id', providerData.service_id)
+                  .single();
+                serviceName = svc?.name || null;
+              }
+            } catch (_) {}
+
+            roleDetails = {
+              ...providerData,
+              experience_years: normalizedExperienceYears,
+              service_category_name: serviceCategoryName,
+              service_name: serviceName
+            };
+          } else {
+            roleDetails = providerData;
+          }
           break;
 
 

@@ -20,6 +20,7 @@ router.get('/', async (req, res) => {
         active, 
         created_at, 
         updated_at,
+        category_id,
         service_categories!inner(
           id,
           name
@@ -32,8 +33,8 @@ router.get('/', async (req, res) => {
     // Format the response to include category name
     const formattedServices = Array.isArray(data) ? data.map(service => ({
       ...service,
-      category_name: service.service_categories?.name || 'Unknown',
-      category: service.service_categories?.id || null
+      service_category_id: service.category_id || service.service_categories?.id || null,
+      category_name: service.service_categories?.name || 'Unknown'
     })) : [];
 
     res.json(formattedServices);

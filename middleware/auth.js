@@ -71,7 +71,9 @@ const loginUser = async (req, res) => {
 
     // Simple password check (in production, use bcrypt.compare)
     const password_hash = Buffer.from(password).toString('base64');
-    if (user.password_hash !== password_hash) {
+    // Strict match on base64 to ensure only the latest updated password works
+    const stored = String(user.password_hash || '');
+    if (stored !== password_hash) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
