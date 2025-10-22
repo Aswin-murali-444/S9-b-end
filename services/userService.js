@@ -1,4 +1,5 @@
 const { createClient } = require('@supabase/supabase-js');
+const { sendSuspensionEmail, sendReactivationEmail } = require('./emailService');
 
 class UserService {
   constructor() {
@@ -310,8 +311,35 @@ class UserService {
   }
 
   // Update user status
-  async updateUserStatus(userId, status) {
+  async updateUserStatus(userId, status, reason = '') {
     try {
+      // Get user details before updating for email
+      const { data: userData, error: fetchError } = await this.supabase
+        .from('users')
+        .select(`
+          id,
+          email,
+          role,
+          status,
+          user_profiles!inner(
+            first_name,
+            last_name
+          )
+        `)
+        .eq('id', userId)
+        .single();
+
+      if (fetchError) {
+        throw new Error(`Failed to fetch user details: ${fetchError.message}`);
+      }
+
+      const oldStatus = userData.status;
+      const userName = userData.user_profiles 
+        ? `${userData.user_profiles.first_name || ''} ${userData.user_profiles.last_name || ''}`.trim()
+        : userData.email;
+      const isServiceProvider = userData.role === 'service_provider';
+
+      // Update user status
       const { error } = await this.supabase
         .from('users')
         .update({ 
@@ -321,7 +349,36 @@ class UserService {
         .eq('id', userId);
 
       if (error) throw error;
-      return { success: true };
+
+      // Send email notification based on status change
+      try {
+        if (status === 'suspended' && oldStatus !== 'suspended') {
+          await sendSuspensionEmail({
+            to: userData.email,
+            userName: userName || userData.email,
+            userEmail: userData.email,
+            reason: reason,
+            isServiceProvider: isServiceProvider
+          });
+          console.log(`✅ Suspension email sent to ${userData.email}`);
+        } else if (status === 'active' && oldStatus === 'suspended') {
+          await sendReactivationEmail({
+            to: userData.email,
+            userName: userName || userData.email,
+            userEmail: userData.email,
+            isServiceProvider: isServiceProvider
+          });
+          console.log(`✅ Reactivation email sent to ${userData.email}`);
+        }
+      } catch (emailError) {
+        // Don't fail the status update if email fails
+        console.warn('⚠️ Failed to send status change email:', emailError.message);
+      }
+
+      return { 
+        success: true, 
+        emailSent: status === 'suspended' || (status === 'active' && oldStatus === 'suspended')
+      };
     } catch (error) {
       throw new Error(`Failed to update user status: ${error.message}`);
     }

@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const UserService = require('../services/userService');
 const { supabase } = require('../lib/supabase');
+const { sendSuspensionEmail, sendReactivationEmail } = require('../services/emailService');
 
 const userService = new UserService();
 
@@ -785,78 +786,174 @@ router.post('/profile/complete', async (req, res) => {
 });
 
 // Update provider profile status (Admin function)
-router.put('/profile/:providerId/status', async (req, res) => {
+router.put('/admin/profile/:providerId/status', async (req, res) => {
   try {
     const { providerId } = req.params;
     const { status, reason } = req.body;
     
-    // Validate status
-    const validStatuses = ['incomplete', 'pending', 'pending_verification', 'verified', 'rejected', 'suspended', 'active'];
+    console.log('Received status update request:', {
+      providerId,
+      status,
+      reason,
+      statusType: typeof status
+    });
+    
+    // Safety check: if frontend sends pending_verification, convert to pending
+    if (status === 'pending_verification') {
+      console.log('Converting pending_verification to pending');
+      status = 'pending';
+    }
+    
+    // Validate status - use correct enum values from provider_profiles table schema
+    const validStatuses = ['incomplete', 'pending', 'active', 'verified', 'rejected', 'suspended'];
     if (!validStatuses.includes(status)) {
+      console.error('Invalid status received:', { status, validStatuses });
       return res.status(400).json({ 
         error: 'Invalid status', 
-        validStatuses 
+        validStatuses,
+        received: status
       });
     }
     
-    // Check if provider profile exists
-    const { data: existingProfile, error: checkError } = await supabase
-      .from('provider_profiles')
-      .select('provider_id, status')
-      .eq('provider_id', providerId)
-      .single();
-    
-    if (checkError || !existingProfile) {
-      return res.status(404).json({ error: 'Provider profile not found' });
+    // Map status values to match service_provider_details enum
+    let mappedStatus = status;
+    if (status === 'pending') {
+      mappedStatus = 'pending_verification';
+    } else if (status === 'verified') {
+      mappedStatus = 'active';
+    } else if (status === 'rejected') {
+      mappedStatus = 'inactive';
+    } else if (status === 'active') {
+      mappedStatus = 'active';
+    } else if (status === 'suspended') {
+      mappedStatus = 'suspended';
     }
     
-    // Update status in provider_profiles table
-    const { data: updateData, error: updateError } = await supabase
-      .from('provider_profiles')
-      .update({ 
-        status: status,
-        updated_at: new Date().toISOString()
-      })
-      .eq('provider_id', providerId)
-      .select();
+    console.log('Status mapping:', { original: status, mapped: mappedStatus });
     
-    if (updateError) {
-      console.error('Profile status update error:', updateError);
+    // Update both tables - try provider_profiles first, then service_provider_details
+    let providerUpdateSuccess = false;
+    let serviceProviderUpdateSuccess = false;
+    
+    // Try to update provider_profiles table
+    try {
+      console.log('Attempting to update provider_profiles with status:', status);
+      const { data: updateData, error: updateError } = await supabase
+        .from('provider_profiles')
+        .update({ 
+          status: status,
+          updated_at: new Date().toISOString()
+        })
+        .eq('provider_id', providerId)
+        .select();
+      
+      if (updateError) {
+        console.warn('Provider profiles update failed:', updateError.message);
+        console.warn('Update error details:', updateError);
+      } else {
+        console.log('Successfully updated provider_profiles status:', updateData);
+        providerUpdateSuccess = true;
+      }
+    } catch (error) {
+      console.warn('Provider profiles update error:', error.message);
+    }
+    
+    // Try to update service_provider_details table
+    try {
+      const { data: updateDetailsData, error: updateDetailsError } = await supabase
+        .from('service_provider_details')
+        .update({ 
+          status: mappedStatus,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', providerId)
+        .select();
+      
+      if (updateDetailsError) {
+        console.warn('Service provider details update failed:', updateDetailsError.message);
+      } else {
+        console.log('Successfully updated service_provider_details status:', updateDetailsData);
+        serviceProviderUpdateSuccess = true;
+      }
+    } catch (error) {
+      console.warn('Service provider details update error:', error.message);
+    }
+    
+    // If at least one update succeeded, consider it a success
+    if (providerUpdateSuccess || serviceProviderUpdateSuccess) {
+      console.log('Status update completed successfully');
+    } else {
+      console.error('Both updates failed');
       return res.status(500).json({ 
-        error: 'Failed to update profile status',
-        details: updateError.message 
+        error: 'Failed to update profile status in both tables',
+        details: 'Check database schema and permissions'
       });
     }
 
-    // Also update status in service_provider_details table
-    const { data: updateDetailsData, error: updateDetailsError } = await supabase
-      .from('service_provider_details')
-      .update({ 
-        status: status,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', providerId)
-      .select();
-    
-    if (updateDetailsError) {
-      console.warn('Failed to update service_provider_details status:', updateDetailsError);
-      // Don't fail the request if this update fails, just log it
+    // Send email notification for status changes (optional, don't fail if this fails)
+    try {
+      // Get user details for email
+      const { data: userData, error: userError } = await supabase
+        .from('users')
+        .select(`
+          id,
+          email,
+          role,
+          status,
+          user_profiles!inner(
+            first_name,
+            last_name
+          )
+        `)
+        .eq('id', providerId)
+        .single();
+
+      if (!userError && userData) {
+        const userName = userData.user_profiles 
+          ? `${userData.user_profiles.first_name || ''} ${userData.user_profiles.last_name || ''}`.trim()
+          : userData.email;
+
+        if (status === 'suspended') {
+          await sendSuspensionEmail({
+            to: userData.email,
+            userName: userName || userData.email,
+            userEmail: userData.email,
+            reason: reason,
+            isServiceProvider: true
+          });
+          console.log(`✅ Provider suspension email sent to ${userData.email}`);
+        } else if (status === 'active') {
+          await sendReactivationEmail({
+            to: userData.email,
+            userName: userName || userData.email,
+            userEmail: userData.email,
+            isServiceProvider: true
+          });
+          console.log(`✅ Provider reactivation email sent to ${userData.email}`);
+        }
+      }
+    } catch (emailError) {
+      // Don't fail the request if email fails
+      console.warn('⚠️ Failed to send provider status change email:', emailError.message);
     }
     
-    // Log status change if reason provided
-    if (reason) {
-      const { error: logError } = await supabase
-        .from('profile_status_log')
-        .insert({
-          provider_id: providerId,
-          old_status: existingProfile.status,
-          new_status: status,
-          reason: reason
-        });
-      
-      if (logError) {
-        console.warn('Failed to log status change:', logError);
+    // Log status change if reason provided (optional, don't fail if this fails)
+    try {
+      if (reason) {
+        const { error: logError } = await supabase
+          .from('profile_status_log')
+          .insert({
+            provider_id: providerId,
+            new_status: status,
+            reason: reason
+          });
+        
+        if (logError) {
+          console.warn('Failed to log status change:', logError);
+        }
       }
+    } catch (logError) {
+      console.warn('Failed to log status change:', logError.message);
     }
     
     res.json({ 
@@ -864,7 +961,6 @@ router.put('/profile/:providerId/status', async (req, res) => {
       message: 'Profile status updated successfully',
       data: {
         provider_id: providerId,
-        old_status: existingProfile.status,
         new_status: status,
         reason: reason || null
       }
@@ -913,6 +1009,36 @@ router.get('/profile/:providerId/status', async (req, res) => {
   } catch (error) {
     console.error('Get profile status error:', error);
     res.status(500).json({ error: error.message || 'Failed to get profile status' });
+  }
+});
+
+// Get service provider details from service_provider_details table
+router.get('/service-provider-details/:providerId', async (req, res) => {
+  try {
+    const { providerId } = req.params;
+    
+    const { data: detailsData, error } = await supabase
+      .from('service_provider_details')
+      .select('*')
+      .eq('id', providerId)
+      .single();
+    
+    if (error) {
+      // If no service provider details found, return null
+      return res.json({ 
+        success: true, 
+        data: null 
+      });
+    }
+    
+    res.json({ 
+      success: true, 
+      data: detailsData 
+    });
+    
+  } catch (error) {
+    console.error('Get service provider details error:', error);
+    res.status(500).json({ error: error.message || 'Failed to get service provider details' });
   }
 });
 

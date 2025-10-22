@@ -15,6 +15,7 @@ const aadhaarRouter = require('./routes/aadhaar');
 const cartWishlistRouter = require('./routes/cart-wishlist');
 const aiAssistantRouter = require('./routes/ai-assistant');
 const notificationsRouter = require('./routes/notifications');
+const adminRouter = require('./routes/admin');
 
 // Import middleware modules
 const { getSystemMetrics } = require('./middleware/systemMetrics');
@@ -136,6 +137,7 @@ app.use('/aadhaar', aadhaarRouter);
 app.use('/cart-wishlist', cartWishlistRouter);
 app.use('/ai-assistant', aiAssistantRouter);
 app.use('/notifications', notificationsRouter);
+app.use('/admin', adminRouter);
 
 // Optional mirrors for dev proxies expecting /api prefix
 app.use('/api/categories', categoriesRouter);
@@ -149,6 +151,7 @@ app.use('/api/aadhaar', aadhaarRouter);
 app.use('/api/cart-wishlist', cartWishlistRouter);
 app.use('/api/ai-assistant', aiAssistantRouter);
 app.use('/api/notifications', notificationsRouter);
+app.use('/api/admin', adminRouter);
 
 // Error handling middleware
 app.use((err, req, res, next) => {

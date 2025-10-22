@@ -96,13 +96,13 @@ const getUsersByStatus = async (req, res) => {
 const updateUserStatus = async (req, res) => {
   try {
     const { userId } = req.params;
-    const { status } = req.body;
+    const { status, reason = '' } = req.body;
     
     if (!status) {
       return res.status(400).json({ error: 'Status is required' });
     }
 
-    const result = await userService.updateUserStatus(userId, status);
+    const result = await userService.updateUserStatus(userId, status, reason);
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });

@@ -17,6 +17,7 @@ router.get('/', async (req, res) => {
         offer_price,
         offer_percentage,
         offer_enabled,
+        service_type,
         active, 
         created_at, 
         updated_at,
@@ -87,7 +88,7 @@ router.post('/check-name', async (req, res) => {
 // Create service
 router.post('/', async (req, res) => {
   try {
-    const { categoryId, name, description, iconBase64, iconFileName, iconMimeType, duration, price, offerPrice, offerPercentage, offerEnabled, active = true } = req.body || {};
+    const { categoryId, name, description, iconBase64, iconFileName, iconMimeType, duration, price, offerPrice, offerPercentage, offerEnabled, serviceType = 'individual', active = true } = req.body || {};
     
     console.log('Received service data:', { categoryId, name, duration, price, offerPrice, offerPercentage, offerEnabled });
     
@@ -163,6 +164,7 @@ router.post('/', async (req, res) => {
       offer_price: offerPrice ? parseFloat(offerPrice) : null,
       offer_percentage: offerPercentage ? parseFloat(offerPercentage) : null,
       offer_enabled: Boolean(offerEnabled),
+      service_type: serviceType && ['individual', 'group'].includes(serviceType) ? serviceType : 'individual',
       active: Boolean(active)
     };
     
@@ -181,6 +183,7 @@ router.post('/', async (req, res) => {
         offer_price,
         offer_percentage,
         offer_enabled,
+        service_type,
         active, 
         created_at, 
         updated_at,
@@ -233,6 +236,7 @@ router.get('/:id', async (req, res) => {
         offer_price,
         offer_percentage,
         offer_enabled,
+        service_type,
         active, 
         created_at, 
         updated_at,
@@ -263,7 +267,7 @@ router.get('/:id', async (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { categoryId, name, description, iconBase64, iconFileName, iconMimeType, duration, price, offerPrice, offerPercentage, offerEnabled, active } = req.body || {};
+    const { categoryId, name, description, iconBase64, iconFileName, iconMimeType, duration, price, offerPrice, offerPercentage, offerEnabled, serviceType, active } = req.body || {};
     
     const update = {};
     
@@ -293,6 +297,7 @@ router.put('/:id', async (req, res) => {
     if (typeof offerPrice !== 'undefined') update.offer_price = offerPrice ? parseFloat(offerPrice) : null;
     if (typeof offerPercentage !== 'undefined') update.offer_percentage = offerPercentage ? parseFloat(offerPercentage) : null;
     if (typeof offerEnabled !== 'undefined') update.offer_enabled = Boolean(offerEnabled);
+    if (typeof serviceType !== 'undefined') update.service_type = serviceType && ['individual', 'group'].includes(serviceType) ? serviceType : 'individual';
     if (typeof active !== 'undefined') update.active = Boolean(active);
     
     // Handle icon upload to Supabase Storage
@@ -343,6 +348,7 @@ router.put('/:id', async (req, res) => {
         offer_price,
         offer_percentage,
         offer_enabled,
+        service_type,
         active, 
         created_at, 
         updated_at,
@@ -387,6 +393,7 @@ router.patch('/:id/block', async (req, res) => {
         offer_price,
         offer_percentage,
         offer_enabled,
+        service_type,
         active, 
         created_at, 
         updated_at,
@@ -431,6 +438,7 @@ router.patch('/:id/unblock', async (req, res) => {
         offer_price,
         offer_percentage,
         offer_enabled,
+        service_type,
         active, 
         created_at, 
         updated_at,
@@ -475,6 +483,7 @@ router.post('/:id/block', async (req, res) => {
         offer_price,
         offer_percentage,
         offer_enabled,
+        service_type,
         active, 
         created_at, 
         updated_at,
@@ -518,6 +527,7 @@ router.post('/:id/unblock', async (req, res) => {
         offer_price,
         offer_percentage,
         offer_enabled,
+        service_type,
         active, 
         created_at, 
         updated_at,

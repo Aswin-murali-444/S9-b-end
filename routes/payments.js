@@ -83,11 +83,12 @@ module.exports = router;
 // Verify payment and create booking atomically
 router.post('/confirm-booking', async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, booking } = req.body || {};
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    let { booking, bookings } = req.body || {};
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({ error: 'Missing Razorpay verification fields' });
     }
-    if (!booking || typeof booking !== 'object') {
+    if (!booking && !Array.isArray(bookings)) {
       return res.status(400).json({ error: 'Missing booking payload' });
     }
 
@@ -100,41 +101,57 @@ router.post('/confirm-booking', async (req, res) => {
       return res.status(400).json({ error: 'Invalid signature' });
     }
 
-    // Validate minimal booking fields
+    // Normalize to an array of booking payloads
+    const bookingPayloads = Array.isArray(bookings) ? bookings : [booking];
+
+    // Validate each booking and enrich
     const required = ['user_id', 'service_id', 'scheduled_date', 'scheduled_time', 'service_address', 'contact_phone', 'base_price', 'total_amount', 'payment_method'];
-    for (const f of required) {
-      if (booking[f] === undefined || booking[f] === null || booking[f] === '') {
-        return res.status(400).json({ error: `Missing field: ${f}`, field: f });
+    const enrichedPayloads = [];
+    for (const b of bookingPayloads) {
+      for (const f of required) {
+        if (b[f] === undefined || b[f] === null || b[f] === '') {
+          return res.status(400).json({ error: `Missing field: ${f}`, field: f });
+        }
       }
+
+      // Derive category_id if missing
+      let categoryId = b.category_id;
+      if (!categoryId) {
+        const { data: svc, error: svcErr } = await supabase
+          .from('services')
+          .select('id, category_id')
+          .eq('id', b.service_id)
+          .single();
+        if (svcErr || !svc) {
+          return res.status(400).json({ error: 'Invalid service. Unable to determine category.', field: 'service_id' });
+        }
+        categoryId = svc.category_id;
+      }
+
+      enrichedPayloads.push({
+        ...b,
+        category_id: categoryId,
+        payment_status: 'completed',
+        payment_transaction_id: razorpay_payment_id,
+        payment_gateway_response: { razorpay_order_id, razorpay_payment_id, razorpay_signature },
+        booking_status: b.booking_status || 'pending'
+      });
     }
 
-    // Ensure category_id present (derive from service if needed)
-    if (!booking.category_id) {
-      const { data: svc, error: svcErr } = await supabase
-        .from('services')
-        .select('id, category_id')
-        .eq('id', booking.service_id)
-        .single();
-      if (svcErr || !svc) {
-        return res.status(400).json({ error: 'Invalid service. Unable to determine category.', field: 'service_id' });
-      }
-      booking.category_id = svc.category_id;
-    }
-
-    // Force completed payment fields
-    booking.payment_status = 'completed';
-    booking.payment_transaction_id = razorpay_payment_id;
-    booking.payment_gateway_response = { razorpay_order_id, razorpay_payment_id, razorpay_signature };
-    if (!booking.booking_status) booking.booking_status = 'pending';
-
+    // Insert one or many
     const { data, error } = await supabase
       .from('bookings')
-      .insert(booking)
-      .select()
-      .single();
+      .insert(enrichedPayloads)
+      .select('*');
 
     if (error) return res.status(400).json({ error: error.message });
-    return res.json({ booking: data });
+
+    // Shape response to support both single and multi
+    if (Array.isArray(bookings)) {
+      return res.json({ bookings: data });
+    } else {
+      return res.json({ booking: Array.isArray(data) ? data[0] : data });
+    }
   } catch (error) {
     console.error('confirm-booking error:', error);
     return res.status(500).json({ error: 'Failed to confirm booking' });

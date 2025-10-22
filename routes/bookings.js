@@ -1,5 +1,6 @@
 const express = require('express');
 const { supabase } = require('../lib/supabase');
+const { createBookingNotification } = require('../services/notificationService');
 
 const router = express.Router();
 
@@ -441,6 +442,24 @@ router.put('/:bookingId/assign', async (req, res) => {
       return res.status(500).json({ error: 'Failed to assign booking' });
     }
 
+    // Create notification for customer
+    const notificationResult = await createBookingNotification(
+      updatedBooking.user_id,
+      updatedBooking.id,
+      'assigned',
+      {
+        scheduled_date: updatedBooking.scheduled_date,
+        scheduled_time: updatedBooking.scheduled_time,
+        service_address: updatedBooking.service_address,
+        total_amount: updatedBooking.total_amount
+      }
+    );
+
+    if (!notificationResult.success) {
+      console.error('Failed to create notification:', notificationResult.error);
+      // Don't fail the request, just log the error
+    }
+
     return res.json({ 
       message: 'Booking assigned successfully',
       booking: updatedBooking
@@ -498,6 +517,26 @@ router.put('/:bookingId/status', async (req, res) => {
     if (error) {
       console.error('Error updating booking status:', error);
       return res.status(500).json({ error: 'Failed to update booking status' });
+    }
+
+    // Create notification for customer based on status change
+    if (['confirmed', 'in_progress', 'completed', 'cancelled'].includes(status)) {
+      const notificationResult = await createBookingNotification(
+        booking.user_id,
+        booking.id,
+        status === 'in_progress' ? 'started' : status,
+        {
+          scheduled_date: booking.scheduled_date,
+          scheduled_time: booking.scheduled_time,
+          service_address: booking.service_address,
+          total_amount: booking.total_amount
+        }
+      );
+
+      if (!notificationResult.success) {
+        console.error('Failed to create notification:', notificationResult.error);
+        // Don't fail the request, just log the error
+      }
     }
 
     return res.json({ 
