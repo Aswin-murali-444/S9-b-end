@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const supabase = require('../lib/supabase');
+const { supabase } = require('../lib/supabase');
 
 // Assign team to a booking
 const assignTeamToBooking = async (req, res) => {

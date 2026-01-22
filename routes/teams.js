@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const supabase = require('../lib/supabase');
+const { supabase } = require('../lib/supabase');
 
 // Create a new team
 const createTeam = async (req, res) => {
@@ -512,10 +512,145 @@ const deleteTeam = async (req, res) => {
   }
 };
 
+// Get team members for a specific provider
+const getProviderTeamMembers = async (req, res) => {
+  try {
+    const { providerId } = req.params;
+
+    if (!providerId) {
+      return res.status(400).json({ error: 'Provider ID is required' });
+    }
+
+    // Find the team where this provider is a member
+    const { data: teamMembers, error: teamMembersError } = await supabase
+      .from('team_members')
+      .select(`
+        id,
+        role,
+        status,
+        joined_at,
+        team_id,
+        teams:team_id(
+          id,
+          name,
+          description
+        )
+      `)
+      .eq('user_id', providerId)
+      .eq('status', 'active');
+
+    if (teamMembersError) {
+      console.error('Error fetching team members:', teamMembersError);
+      return res.status(500).json({ error: teamMembersError.message });
+    }
+
+    if (!teamMembers || teamMembers.length === 0) {
+      return res.json({
+        success: true,
+        data: {
+          team_members: []
+        }
+      });
+    }
+
+    // Get the team ID (assuming provider is in one team)
+    const teamId = teamMembers[0].team_id;
+
+    // Get all members of this team
+    const { data: allTeamMembers, error: allMembersError } = await supabase
+      .from('team_members')
+      .select(`
+        id,
+        role,
+        status,
+        joined_at,
+        user_id,
+        users:user_id(
+          id,
+          email,
+          user_profiles(
+            first_name,
+            last_name,
+            phone
+          ),
+          service_provider_details(
+            specialization,
+            experience_years,
+            service_category_id,
+            service_categories:service_category_id(
+              name
+            )
+          )
+        )
+      `)
+      .eq('team_id', teamId)
+      .eq('status', 'active');
+
+    if (allMembersError) {
+      console.error('Error fetching all team members:', allMembersError);
+      return res.status(500).json({ error: allMembersError.message });
+    }
+
+    // Format team members data
+    const formattedMembers = (allTeamMembers || []).map(member => {
+      const user = member.users;
+      // Handle user_profiles - could be array or single object
+      const profile = Array.isArray(user?.user_profiles) 
+        ? user.user_profiles[0] 
+        : user?.user_profiles || {};
+      
+      // Handle service_provider_details - could be array or single object
+      const providerDetails = Array.isArray(user?.service_provider_details) 
+        ? user.service_provider_details[0] 
+        : user?.service_provider_details || {};
+      
+      // Handle service_categories - could be array or single object
+      const category = Array.isArray(providerDetails?.service_categories) 
+        ? providerDetails.service_categories[0] 
+        : providerDetails?.service_categories || {};
+
+      return {
+        id: member.id,
+        user_id: member.user_id,
+        first_name: profile.first_name || '',
+        last_name: profile.last_name || '',
+        name: `${profile.first_name || ''} ${profile.last_name || ''}`.trim() || 'Unknown',
+        email: user?.email || '',
+        phone: profile.phone || '',
+        role: member.role || 'member',
+        status: member.status || 'active',
+        specialization: providerDetails.specialization || '',
+        service_category_name: category.name || '',
+        experience_years: providerDetails.experience_years || 0,
+        joined_date: member.joined_at || null,
+        created_at: member.joined_at || null
+      };
+    });
+
+    // Handle teams relationship - could be array or single object
+    const team = Array.isArray(teamMembers[0]?.teams) 
+      ? teamMembers[0].teams[0] 
+      : teamMembers[0]?.teams || null;
+
+    res.json({
+      success: true,
+      data: {
+        team_members: formattedMembers,
+        team: team
+      }
+    });
+
+  } catch (error) {
+    console.error('Get provider team members error:', error);
+    res.status(500).json({ error: error.message || 'Failed to get provider team members' });
+  }
+};
+
 // Routes
 router.post('/', createTeam);
 router.get('/', getTeams);
 router.get('/available-providers', getAvailableProviders);
+router.get('/provider/:providerId/team', getProviderTeamMembers);
 router.get('/:id', getTeamById);
 router.put('/:id', updateTeam);
 router.delete('/:id', deleteTeam);
