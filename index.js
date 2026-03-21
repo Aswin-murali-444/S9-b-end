@@ -78,6 +78,11 @@ app.use(cors({
     if (vercelPreviewPattern.test(origin)) {
       return callback(null, true);
     }
+
+    // Any Vercel deployment (*.vercel.app) — previews and production aliases
+    if (/^https:\/\/[^/]+\.vercel\.app$/i.test(origin)) {
+      return callback(null, true);
+    }
     
     // Reject other origins
     callback(new Error('Not allowed by CORS'));
