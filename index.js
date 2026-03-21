@@ -48,7 +48,20 @@ const allowedOrigins = [
   'https://s9-f-end.vercel.app'
 ];
 
-// Allow any Vercel preview deployment
+// Extra origins from Render/env (comma-separated), e.g. your real Vercel production URL
+const envCorsOrigins = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+for (const u of envCorsOrigins) {
+  if (u && !allowedOrigins.includes(u)) allowedOrigins.push(u);
+}
+if (process.env.FRONTEND_URL) {
+  const front = process.env.FRONTEND_URL.replace(/\/$/, '');
+  if (front && !allowedOrigins.includes(front)) allowedOrigins.push(front);
+}
+
+// Allow any Vercel preview deployment for this project name pattern
 const vercelPreviewPattern = /^https:\/\/s9-f-end.*\.vercel\.app$/;
 
 app.use(cors({
