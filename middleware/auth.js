@@ -1,4 +1,5 @@
 const UserService = require('../services/userService');
+const { supabase } = require('../lib/supabase');
 
 // Initialize User Service
 const userService = new UserService();
@@ -89,7 +90,38 @@ const loginUser = async (req, res) => {
       return res.status(403).json({ error: reason, status: user.status });
     }
 
-    // Get dashboard route based on role
+    // Ensure Supabase Auth user exists (fixes orphaned users / login via backend)
+    let authFixed = false;
+    const normalizedEmail = String(email).toLowerCase().trim();
+    try {
+      const { data: authLookup } = await supabase.auth.admin.getUserByEmail(normalizedEmail);
+      const existingAuth = authLookup?.user;
+
+      if (existingAuth) {
+        await supabase.auth.admin.updateUserById(existingAuth.id, { password });
+        authFixed = true;
+      } else {
+        const { data: createdAuth, error: authErr } = await supabase.auth.admin.createUser({
+          email: normalizedEmail,
+          password,
+          email_confirm: true,
+          user_metadata: { role: user.role }
+        });
+        if (authErr) throw authErr;
+        const authUserId = createdAuth?.user?.id;
+        if (authUserId) {
+          await supabase.from('users').update({
+            auth_user_id: authUserId,
+            password_hash: Buffer.from(password).toString('base64')
+          }).eq('id', user.id);
+          authFixed = true;
+        }
+      }
+    } catch (authErr) {
+      console.error('Auth sync failed during login:', authErr?.message || authErr);
+      return res.status(500).json({ error: 'Login verified but could not sync credentials. Please try Resend credentials from admin.' });
+    }
+
     const dashboardRoute = userService.getDashboardRoute(user.role);
 
     res.json({ 
@@ -99,7 +131,8 @@ const loginUser = async (req, res) => {
         role: user.role,
         status: user.status
       },
-      dashboardRoute
+      dashboardRoute,
+      authFixed
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

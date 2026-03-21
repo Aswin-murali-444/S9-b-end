@@ -15,8 +15,8 @@ const aadhaarRouter = require('./routes/aadhaar');
 const cartWishlistRouter = require('./routes/cart-wishlist');
 const aiAssistantRouter = require('./routes/ai-assistant');
 const notificationsRouter = require('./routes/notifications');
-const adminRouter = require('./routes/admin');
 const reviewsRouter = require('./routes/reviews');
+const adminRouter = require('./routes/admin');
 
 // Import middleware modules
 const { getSystemMetrics } = require('./middleware/systemMetrics');
@@ -35,40 +35,42 @@ const {
   getDashboardRoute
 } = require('./middleware/userManagement');
 const { uploadProfilePicture } = require('./middleware/profileUpload');
-const { createServiceProvider, updateServiceProviderDetails, listServiceProviders } = require('./middleware/providerAdmin');
+const { createServiceProvider, updateServiceProviderDetails, listServiceProviders, getServiceProvider, resendProviderCredentials } = require('./middleware/providerAdmin');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
+// Middleware - CORS configuration
+const allowedOrigins = [
+  'http://localhost:5173', 
+  'http://localhost:3000', 
+  'http://127.0.0.1:5173',
+  'https://s9-f-end.vercel.app'
+];
+
+// Allow any Vercel preview deployment
+const vercelPreviewPattern = /^https:\/\/s9-f-end.*\.vercel\.app$/;
+
 app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, etc.)
     if (!origin) return callback(null, true);
     
-    // List of allowed origins
-    const allowedOrigins = [
-      'http://localhost:5173',
-      'http://localhost:3000',
-      'http://127.0.0.1:5173',
-      'https://s9-f-end.vercel.app' // Main production URL
-    ];
-    
-    // Allow all Vercel preview deployments
-    if (origin.includes('.vercel.app')) {
-      return callback(null, true);
-    }
-    
-    // Check if origin is in allowed list
+    // Check against allowed origins
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
     
-    // Reject origin
+    // Check if it's a Vercel preview deployment
+    if (vercelPreviewPattern.test(origin)) {
+      return callback(null, true);
+    }
+    
+    // Reject other origins
     callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 app.use(express.json({ limit: '6mb' }));
@@ -140,15 +142,24 @@ app.get('/dashboard-route/:userId', getDashboardRoute);
 // Profile picture upload
 app.post('/users/profile-picture-upload', uploadProfilePicture);
 
-// Provider admin endpoints
+// Provider admin endpoints (must be before modular routers to avoid conflicts)
 app.post('/admin/providers', createServiceProvider);
+app.post('/admin/providers/:userId/resend-credentials', resendProviderCredentials);
 app.put('/admin/providers/:userId', updateServiceProviderDetails);
 app.get('/admin/providers', listServiceProviders);
+app.get('/admin/providers/:providerId', getServiceProvider);
+
+// Admin bookings (explicit route so it always matches)
+const { getAdminBookings } = require('./routes/admin');
+app.get('/admin/bookings', getAdminBookings);
 
 // Optional: Mirror under /api for dev proxies that expect /api prefix
 app.post('/api/admin/providers', createServiceProvider);
+app.post('/api/admin/providers/:userId/resend-credentials', resendProviderCredentials);
 app.put('/api/admin/providers/:userId', updateServiceProviderDetails);
 app.get('/api/admin/providers', listServiceProviders);
+app.get('/api/admin/providers/:providerId', getServiceProvider);
+app.get('/api/admin/bookings', getAdminBookings);
 
 // Mount modular routers
 app.use('/categories', categoriesRouter);
@@ -162,8 +173,8 @@ app.use('/aadhaar', aadhaarRouter);
 app.use('/cart-wishlist', cartWishlistRouter);
 app.use('/ai-assistant', aiAssistantRouter);
 app.use('/notifications', notificationsRouter);
-app.use('/admin', adminRouter);
 app.use('/reviews', reviewsRouter);
+app.use('/admin', adminRouter);
 
 // Optional mirrors for dev proxies expecting /api prefix
 app.use('/api/categories', categoriesRouter);
@@ -177,8 +188,8 @@ app.use('/api/aadhaar', aadhaarRouter);
 app.use('/api/cart-wishlist', cartWishlistRouter);
 app.use('/api/ai-assistant', aiAssistantRouter);
 app.use('/api/notifications', notificationsRouter);
-app.use('/api/admin', adminRouter);
 app.use('/api/reviews', reviewsRouter);
+app.use('/api/admin', adminRouter);
 
 // Error handling middleware
 app.use((err, req, res, next) => {

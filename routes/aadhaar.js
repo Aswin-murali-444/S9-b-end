@@ -36,9 +36,47 @@ router.post('/extract', upload.single('image'), async (req, res) => {
     });
   } catch (error) {
     console.error('Aadhaar extraction error:', error);
-    res.status(500).json({
+    const msg = error.response?.data?.error?.message || error.message;
+    const status = error.response?.status;
+    // 402 = Insufficient credits – treat as soft failure and allow manual entry
+      if (
+        status === 402 ||
+        msg?.includes('Insufficient credits') ||
+        String(msg).includes('402')
+      ) {
+      return res.status(200).json({
+        success: true,
+        data: {
+          aadhaar_number: '',
+          name: '',
+          dob: '',
+          gender: '',
+          address: '',
+          pincode: ''
+        },
+        warning: 'Aadhaar extraction skipped: OpenRouter account has no credits. Please fill details manually.'
+      });
+    }
+
+      // Groq vision can return 400 "invalid image data" for some formats/encodings.
+      // Treat it as a soft failure so the user can enter details manually.
+      if (status === 400 && msg?.includes('invalid image data')) {
+        return res.status(200).json({
+          success: true,
+          data: {
+            aadhaar_number: '',
+            name: '',
+            dob: '',
+            gender: '',
+            address: '',
+            pincode: ''
+          },
+          warning: 'Aadhaar extraction skipped: image could not be processed. Please fill details manually.'
+        });
+      }
+    res.status(status && status >= 400 && status < 600 ? status : 500).json({
       success: false,
-      error: error.message
+      error: msg
     });
   }
 });
@@ -67,9 +105,44 @@ router.post('/extract-both', upload.fields([
     });
   } catch (error) {
     console.error('Aadhaar extraction error:', error);
-    res.status(500).json({
+    const status = error.response?.status;
+    const msg = error.response?.data?.error?.message || error.message;
+    if (
+      status === 402 ||
+      msg?.includes('Insufficient credits') ||
+      String(msg).includes('402')
+    ) {
+      return res.status(200).json({
+        success: true,
+        data: {
+          aadhaar_number: '',
+          name: '',
+          dob: '',
+          gender: '',
+          address: '',
+          pincode: ''
+        },
+        warning: 'Aadhaar extraction skipped: OpenRouter account has no credits. Please fill details manually.'
+      });
+    }
+
+    if (status === 400 && msg?.includes('invalid image data')) {
+      return res.status(200).json({
+        success: true,
+        data: {
+          aadhaar_number: '',
+          name: '',
+          dob: '',
+          gender: '',
+          address: '',
+          pincode: ''
+        },
+        warning: 'Aadhaar extraction skipped: image could not be processed. Please fill details manually.'
+      });
+    }
+    res.status(status && status >= 400 && status < 600 ? status : 500).json({
       success: false,
-      error: error.message
+      error: msg
     });
   }
 });

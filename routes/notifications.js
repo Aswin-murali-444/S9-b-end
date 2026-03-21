@@ -2,6 +2,15 @@ const express = require('express');
 const router = express.Router();
 const { supabase } = require('../lib/supabase');
 
+// Resolve userId (auth UID or users.id) to users.id for recipient_id lookups
+async function resolveUserId(idOrAuthUid) {
+  if (!idOrAuthUid) return null;
+  const { data: byId } = await supabase.from('users').select('id').eq('id', idOrAuthUid).maybeSingle();
+  if (byId?.id) return byId.id;
+  const { data: byAuth } = await supabase.from('users').select('id').eq('auth_user_id', idOrAuthUid).maybeSingle();
+  return byAuth?.id || null;
+}
+
 // Get all notifications (for admin dashboard)
 router.get('/', async (req, res) => {
   try {
@@ -102,9 +111,18 @@ router.get('/', async (req, res) => {
   }
 });
 
-// Get unread notifications count
+// Get unread notifications count (global – for admin; use /user/:userId/unread-count for per-user)
 router.get('/unread-count', async (req, res) => {
   try {
+    const { data: testData, error: testError } = await supabase
+      .from('notifications')
+      .select('id')
+      .limit(1);
+
+    if (testError && testError.code === 'PGRST116') {
+      return res.json({ success: true, data: { unread_count: 0 } });
+    }
+
     const { count, error } = await supabase
       .from('notifications')
       .select('*', { count: 'exact', head: true })
@@ -276,7 +294,8 @@ router.put('/:notificationId/dismiss', async (req, res) => {
 // Dismiss notification for a specific user
 router.put('/user/:userId/:notificationId/dismiss', async (req, res) => {
   try {
-    const { userId, notificationId } = req.params;
+    const { userId: rawUserId, notificationId } = req.params;
+    const userId = await resolveUserId(rawUserId) || rawUserId;
 
     console.log(`Dismissing notification ${notificationId} for user ${userId}`);
 
@@ -356,7 +375,7 @@ router.get('/provider/:providerId', async (req, res) => {
     const { data: notifications, error } = await supabase
       .from('notifications')
       .select('*')
-      .eq('provider_id', providerId)
+      .eq('recipient_id', providerId)
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
@@ -369,7 +388,7 @@ router.get('/provider/:providerId', async (req, res) => {
     const { count, error: countError } = await supabase
       .from('notifications')
       .select('*', { count: 'exact', head: true })
-      .eq('provider_id', providerId);
+      .eq('recipient_id', providerId);
 
     if (countError) {
       console.error('Get provider notifications count error:', countError);
@@ -394,151 +413,107 @@ router.get('/provider/:providerId', async (req, res) => {
   }
 });
 
-// Get notifications for a specific customer/user (based on bookings)
+// Get notifications for a specific customer/user
 router.get('/user/:userId', async (req, res) => {
   try {
-    const { userId } = req.params;
+    const { userId: rawUserId } = req.params;
     const { page = 1, limit = 20, status } = req.query;
     const offset = (page - 1) * limit;
 
-    console.log(`Fetching booking notifications for user: ${userId}, page: ${page}, limit: ${limit}, status: ${status}`);
+    // Resolve auth UID to users.id (notifications.recipient_id is usually users.id)
+    const resolvedId = await resolveUserId(rawUserId);
+    const userIdsToQuery = [resolvedId, rawUserId].filter(Boolean);
+    const uniqueIds = [...new Set(userIdsToQuery)];
 
-    // Validate userId format (should be UUID)
+    console.log(`Fetching notifications for user: raw=${rawUserId}, resolved=${resolvedId || 'none'}, page: ${page}, limit: ${limit}, status: ${status}`);
+
+    // Validate UUID format
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    if (!uuidRegex.test(userId)) {
-      console.error('Invalid userId format:', userId);
+    if (!uuidRegex.test(rawUserId)) {
+      console.error('Invalid userId format:', rawUserId);
       return res.status(400).json({ error: 'Invalid user ID format' });
     }
 
-    // Handle user ID mapping issue - check both auth user ID and users table ID
-    // For the specific user aswinkavumkal2002@gmail.com
-    const authUserId = 'ddb8bbd1-c8b9-4652-ac43-30c14aecb0d8';
-    const usersTableId = '23c88529-cae1-4fa5-af9f-9153db425cc5';
-    
-    let query;
-    if (userId === authUserId) {
-      // If requesting with auth user ID, check both IDs
-      console.log(`Handling user ID mapping for ${userId} - checking both auth and users table IDs`);
-      query = supabase
-        .from('bookings')
-        .select('*')
-        .or(`user_id.eq.${authUserId},user_id.eq.${usersTableId}`)
-        .order('created_at', { ascending: false })
-        .range(offset, offset + limit - 1);
-    } else {
-      // Normal case - use the provided user ID
-      query = supabase
-        .from('bookings')
-        .select('*')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .range(offset, offset + limit - 1);
+    // Check if notifications table exists first
+    const { data: testData, error: testError } = await supabase
+      .from('notifications')
+      .select('id')
+      .limit(1);
+
+    if (testError && testError.code === 'PGRST116') {
+      // Table doesn't exist, return empty result
+      return res.json({
+        success: true,
+        data: {
+          notifications: [],
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total: 0,
+            pages: 0
+          }
+        }
+      });
     }
 
-    const { data: bookings, error } = await query;
+    // Query by resolved users.id and/or raw (auth UID) so we find notifications either way
+    let query = supabase
+      .from('notifications')
+      .select('*')
+      .in('recipient_id', uniqueIds)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data: notifications, error } = await query;
 
     if (error) {
-      console.error('Get user bookings error:', error);
+      console.error('Get user notifications error:', error);
       return res.status(500).json({ 
-        error: 'Failed to fetch bookings',
+        error: 'Failed to fetch notifications',
         details: error.message,
         code: error.code
       });
     }
 
-    console.log(`Found ${bookings?.length || 0} bookings for user ${userId}`);
+    console.log(`Found ${notifications?.length || 0} notifications for user (ids: ${uniqueIds.join(', ')})`);
 
-    // Convert bookings to notification format
-    const notifications = (bookings || []).map(booking => {
-      let notificationType, title, message, priority = 'medium';
-      
-      switch (booking.booking_status) {
-        case 'pending':
-          notificationType = 'booking_pending';
-          title = 'Booking Request Sent';
-          message = `Your service booking for ${booking.scheduled_date} at ${booking.scheduled_time} has been sent and is awaiting provider assignment.`;
-          priority = 'medium';
-          break;
-        case 'assigned':
-          notificationType = 'booking_assigned';
-          title = 'Service Provider Assigned';
-          message = `A service provider has been assigned to your booking scheduled for ${booking.scheduled_date} at ${booking.scheduled_time}.`;
-          priority = 'high';
-          break;
-        case 'confirmed':
-          notificationType = 'booking_confirmed';
-          title = 'Booking Confirmed';
-          message = `Your booking scheduled for ${booking.scheduled_date} at ${booking.scheduled_time} has been confirmed by the service provider.`;
-          priority = 'medium';
-          break;
-        case 'in_progress':
-          notificationType = 'service_started';
-          title = 'Service Started';
-          message = `Your service has started. The provider is on their way to ${booking.service_address}.`;
-          priority = 'medium';
-          break;
-        case 'completed':
-          notificationType = 'service_completed';
-          title = 'Service Completed';
-          message = `Your service has been completed successfully. Please rate your experience.`;
-          priority = 'medium';
-          break;
-        case 'cancelled':
-          notificationType = 'booking_cancelled';
-          title = 'Booking Cancelled';
-          message = `Your booking scheduled for ${booking.scheduled_date} has been cancelled.`;
-          priority = 'high';
-          break;
-        default:
-          notificationType = 'booking_update';
-          title = 'Booking Update';
-          message = `Your booking status has been updated to: ${booking.booking_status}`;
-          priority = 'medium';
-      }
+    // Format notifications for frontend (ensure created_at exists)
+    const formattedNotifications = (notifications || []).map(notification => ({
+      id: notification.id,
+      type: notification.type,
+      title: notification.title,
+      message: notification.message,
+      status: notification.status,
+      priority: notification.priority,
+      time: formatTimeAgo(notification.created_at || notification.createdAt || new Date().toISOString()),
+      createdAt: notification.created_at || notification.createdAt || new Date().toISOString(),
+      metadata: notification.metadata
+    }));
 
-      return {
-        id: booking.id,
-        type: notificationType,
-        title: title,
-        message: message,
-        status: booking.booking_status === 'completed' ? 'read' : 'unread',
-        priority: priority,
-        time: formatTimeAgo(booking.created_at),
-        createdAt: booking.created_at,
-        metadata: {
-          booking_id: booking.id,
-          scheduled_date: booking.scheduled_date,
-          scheduled_time: booking.scheduled_time,
-          service_address: booking.service_address,
-          total_amount: booking.total_amount,
-          payment_status: booking.payment_status,
-          booking_status: booking.booking_status
-        }
-      };
-    });
-
-    // Filter by status if provided
-    let filteredNotifications = notifications;
-    if (status) {
-      filteredNotifications = notifications.filter(n => n.status === status);
-    }
-
-    // Get total count
+    // Get total count (same recipient_id set)
     let countQuery = supabase
-      .from('bookings')
+      .from('notifications')
       .select('*', { count: 'exact', head: true })
-      .eq('user_id', userId);
+      .in('recipient_id', uniqueIds);
+
+    if (status) {
+      countQuery = countQuery.eq('status', status);
+    }
 
     const { count, error: countError } = await countQuery;
 
     if (countError) {
-      console.error('Get user bookings count error:', countError);
+      console.error('Get user notifications count error:', countError);
     }
 
     res.json({
       success: true,
       data: {
-        notifications: filteredNotifications,
+        notifications: formattedNotifications,
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
@@ -559,8 +534,12 @@ router.get('/user/:userId', async (req, res) => {
 
 // Helper function to format time ago
 function formatTimeAgo(dateString) {
+  if (!dateString) return 'Recently';
   const now = new Date();
   const date = new Date(dateString);
+  if (isNaN(date.getTime())) {
+    return 'Recently';
+  }
   const diffInSeconds = Math.floor((now - date) / 1000);
 
   if (diffInSeconds < 60) {
@@ -579,44 +558,46 @@ function formatTimeAgo(dateString) {
   }
 }
 
-// Get unread notifications count for a specific user (based on bookings)
+// Get unread notifications count for a specific user
 router.get('/user/:userId/unread-count', async (req, res) => {
   try {
-    const { userId } = req.params;
+    const { userId: rawUserId } = req.params;
 
-    console.log(`Fetching unread booking count for user: ${userId}`);
+    // Resolve auth UID to users.id; query by both so we count either way
+    const resolvedId = await resolveUserId(rawUserId);
+    const uniqueIds = [...new Set([resolvedId, rawUserId].filter(Boolean))];
+
+    console.log(`Fetching unread notification count for user: raw=${rawUserId}, resolved=${resolvedId || 'none'}`);
 
     // Validate userId format (should be UUID)
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    if (!uuidRegex.test(userId)) {
-      console.error('Invalid userId format:', userId);
+    if (!uuidRegex.test(rawUserId)) {
+      console.error('Invalid userId format:', rawUserId);
       return res.status(400).json({ error: 'Invalid user ID format' });
     }
 
-    // Handle user ID mapping issue - check both auth user ID and users table ID
-    // For the specific user aswinkavumkal2002@gmail.com
-    const authUserId = 'ddb8bbd1-c8b9-4652-ac43-30c14aecb0d8';
-    const usersTableId = '23c88529-cae1-4fa5-af9f-9153db425cc5';
-    
-    let countQuery;
-    if (userId === authUserId) {
-      // If requesting with auth user ID, check both IDs
-      console.log(`Handling user ID mapping for unread count - checking both auth and users table IDs`);
-      countQuery = supabase
-        .from('bookings')
-        .select('*', { count: 'exact', head: true })
-        .or(`user_id.eq.${authUserId},user_id.eq.${usersTableId}`)
-        .neq('booking_status', 'completed');
-    } else {
-      // Normal case - use the provided user ID
-      countQuery = supabase
-        .from('bookings')
-        .select('*', { count: 'exact', head: true })
-        .eq('user_id', userId)
-        .neq('booking_status', 'completed');
+    // Check if notifications table exists first
+    const { data: testData, error: testError } = await supabase
+      .from('notifications')
+      .select('id')
+      .limit(1);
+
+    if (testError && testError.code === 'PGRST116') {
+      // Table doesn't exist, return 0 count
+      return res.json({
+        success: true,
+        data: {
+          unread_count: 0
+        }
+      });
     }
 
-    const { count, error } = await countQuery;
+    // Get unread count for this user (recipient_id = resolved or raw)
+    const { count, error } = await supabase
+      .from('notifications')
+      .select('*', { count: 'exact', head: true })
+      .in('recipient_id', uniqueIds)
+      .eq('status', 'unread');
 
     if (error) {
       console.error('Get user unread count error:', error);
@@ -627,7 +608,7 @@ router.get('/user/:userId/unread-count', async (req, res) => {
       });
     }
 
-    console.log(`Found ${count || 0} unread notifications for user ${userId}`);
+    console.log(`Found ${count || 0} unread notifications for user (ids: ${uniqueIds.join(', ')})`);
 
     res.json({
       success: true,
@@ -645,22 +626,23 @@ router.get('/user/:userId/unread-count', async (req, res) => {
   }
 });
 
-// Mark notification as read for a specific user (update booking status)
+// Mark notification as read for a specific user
 router.put('/user/:userId/:notificationId/read', async (req, res) => {
   try {
-    const { userId, notificationId } = req.params;
+    const { userId: rawUserId, notificationId } = req.params;
+    const userId = await resolveUserId(rawUserId) || rawUserId;
 
-    console.log(`Marking booking ${notificationId} as read for user ${userId}`);
+    console.log(`Marking notification ${notificationId} as read for user ${userId}`);
 
-    // Update the booking status to completed (marking it as read)
+    // Update the notification status to read
     const { data, error } = await supabase
-      .from('bookings')
+      .from('notifications')
       .update({
-        booking_status: 'completed',
-        completed_at: new Date().toISOString()
+        status: 'read',
+        read_at: new Date().toISOString()
       })
       .eq('id', notificationId)
-      .eq('user_id', userId)
+      .eq('recipient_id', userId)
       .select()
       .single();
 
@@ -680,22 +662,24 @@ router.put('/user/:userId/:notificationId/read', async (req, res) => {
   }
 });
 
-// Mark all notifications as read for a specific user (update all bookings to completed)
+// Mark all notifications as read for a specific user
 router.put('/user/:userId/mark-all-read', async (req, res) => {
   try {
-    const { userId } = req.params;
+    const { userId: rawUserId } = req.params;
+    const resolvedId = await resolveUserId(rawUserId);
+    const uniqueIds = [...new Set([resolvedId, rawUserId].filter(Boolean))];
 
-    console.log(`Marking all bookings as completed for user ${userId}`);
+    console.log(`Marking all notifications as read for user: ${uniqueIds.join(', ')}`);
 
-    // Update all non-completed bookings to completed status
+    // Update all unread notifications to read status (recipient_id may be users.id or auth UID)
     const { data, error } = await supabase
-      .from('bookings')
+      .from('notifications')
       .update({
-        booking_status: 'completed',
-        completed_at: new Date().toISOString()
+        status: 'read',
+        read_at: new Date().toISOString()
       })
-      .eq('user_id', userId)
-      .neq('booking_status', 'completed')
+      .in('recipient_id', uniqueIds)
+      .eq('status', 'unread')
       .select();
 
     if (error) {

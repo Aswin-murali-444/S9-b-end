@@ -1,23 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const { createClient } = require('@supabase/supabase-js');
 const { supabase } = require('../lib/supabase');
 const { authenticateUser } = require('../middleware/authMiddleware');
-
-// Helper function to create user-scoped Supabase client
-const getUserSupabaseClient = (accessToken) => {
-  return createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_ANON_KEY,
-    {
-      global: {
-        headers: {
-          Authorization: `Bearer ${accessToken}`
-        }
-      }
-    }
-  );
-};
 
 // =====================================================
 // CART ENDPOINTS
@@ -27,17 +11,11 @@ const getUserSupabaseClient = (accessToken) => {
 router.get('/cart', authenticateUser, async (req, res) => {
   try {
     const userId = req.user?.id;
-    const authHeader = req.headers.authorization;
-    const accessToken = authHeader?.substring(7); // Remove 'Bearer ' prefix
-    
-    if (!userId || !accessToken) {
+    if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    // Create user-scoped Supabase client for RLS to work
-    const userSupabase = getUserSupabaseClient(accessToken);
-
-    const { data: cartItems, error } = await userSupabase
+    const { data: cartItems, error } = await supabase
       .from('user_cart')
       .select(`
         *,
@@ -81,10 +59,7 @@ router.get('/cart', authenticateUser, async (req, res) => {
 router.post('/cart/add', authenticateUser, async (req, res) => {
   try {
     const userId = req.user?.id;
-    const authHeader = req.headers.authorization;
-    const accessToken = authHeader?.substring(7);
-    
-    if (!userId || !accessToken) {
+    if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
@@ -94,11 +69,8 @@ router.post('/cart/add', authenticateUser, async (req, res) => {
       return res.status(400).json({ error: 'Service ID is required' });
     }
 
-    // Create user-scoped Supabase client for RLS to work
-    const userSupabase = getUserSupabaseClient(accessToken);
-
     // Check if item already exists in cart
-    const { data: existingItem } = await userSupabase
+    const { data: existingItem } = await supabase
       .from('user_cart')
       .select('*')
       .eq('user_id', userId)
@@ -107,7 +79,7 @@ router.post('/cart/add', authenticateUser, async (req, res) => {
 
     if (existingItem) {
       // Update quantity
-      const { data, error } = await userSupabase
+      const { data, error } = await supabase
         .from('user_cart')
         .update({ 
           quantity: existingItem.quantity + quantity,
@@ -125,7 +97,7 @@ router.post('/cart/add', authenticateUser, async (req, res) => {
       return res.json({ message: 'Cart item updated', item: data });
     } else {
       // Add new item
-      const { data, error } = await userSupabase
+      const { data, error } = await supabase
         .from('user_cart')
         .insert({
           user_id: userId,
@@ -152,10 +124,7 @@ router.post('/cart/add', authenticateUser, async (req, res) => {
 router.put('/cart/update/:itemId', authenticateUser, async (req, res) => {
   try {
     const userId = req.user?.id;
-    const authHeader = req.headers.authorization;
-    const accessToken = authHeader?.substring(7);
-    
-    if (!userId || !accessToken) {
+    if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
@@ -166,10 +135,7 @@ router.put('/cart/update/:itemId', authenticateUser, async (req, res) => {
       return res.status(400).json({ error: 'Quantity must be greater than 0' });
     }
 
-    // Create user-scoped Supabase client for RLS to work
-    const userSupabase = getUserSupabaseClient(accessToken);
-
-    const { data, error } = await userSupabase
+    const { data, error } = await supabase
       .from('user_cart')
       .update({ 
         quantity,
@@ -200,19 +166,13 @@ router.put('/cart/update/:itemId', authenticateUser, async (req, res) => {
 router.delete('/cart/remove/:itemId', authenticateUser, async (req, res) => {
   try {
     const userId = req.user?.id;
-    const authHeader = req.headers.authorization;
-    const accessToken = authHeader?.substring(7);
-    
-    if (!userId || !accessToken) {
+    if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
     const { itemId } = req.params;
 
-    // Create user-scoped Supabase client for RLS to work
-    const userSupabase = getUserSupabaseClient(accessToken);
-
-    const { error } = await userSupabase
+    const { error } = await supabase
       .from('user_cart')
       .delete()
       .eq('id', itemId)
@@ -234,17 +194,11 @@ router.delete('/cart/remove/:itemId', authenticateUser, async (req, res) => {
 router.delete('/cart/clear', authenticateUser, async (req, res) => {
   try {
     const userId = req.user?.id;
-    const authHeader = req.headers.authorization;
-    const accessToken = authHeader?.substring(7);
-    
-    if (!userId || !accessToken) {
+    if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    // Create user-scoped Supabase client for RLS to work
-    const userSupabase = getUserSupabaseClient(accessToken);
-
-    const { error } = await userSupabase
+    const { error } = await supabase
       .from('user_cart')
       .delete()
       .eq('user_id', userId);
@@ -269,17 +223,11 @@ router.delete('/cart/clear', authenticateUser, async (req, res) => {
 router.get('/wishlist', authenticateUser, async (req, res) => {
   try {
     const userId = req.user?.id;
-    const authHeader = req.headers.authorization;
-    const accessToken = authHeader?.substring(7); // Remove 'Bearer ' prefix
-    
-    if (!userId || !accessToken) {
+    if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    // Create user-scoped Supabase client for RLS to work
-    const userSupabase = getUserSupabaseClient(accessToken);
-
-    const { data: wishlistItems, error } = await userSupabase
+    const { data: wishlistItems, error } = await supabase
       .from('user_wishlist')
       .select(`
         *,
@@ -323,10 +271,7 @@ router.get('/wishlist', authenticateUser, async (req, res) => {
 router.post('/wishlist/add', authenticateUser, async (req, res) => {
   try {
     const userId = req.user?.id;
-    const authHeader = req.headers.authorization;
-    const accessToken = authHeader?.substring(7);
-    
-    if (!userId || !accessToken) {
+    if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
@@ -336,11 +281,8 @@ router.post('/wishlist/add', authenticateUser, async (req, res) => {
       return res.status(400).json({ error: 'Service ID is required' });
     }
 
-    // Create user-scoped Supabase client for RLS to work
-    const userSupabase = getUserSupabaseClient(accessToken);
-
     // Check if item already exists in wishlist
-    const { data: existingItem } = await userSupabase
+    const { data: existingItem } = await supabase
       .from('user_wishlist')
       .select('*')
       .eq('user_id', userId)
@@ -352,7 +294,7 @@ router.post('/wishlist/add', authenticateUser, async (req, res) => {
     }
 
     // Add new item
-    const { data, error } = await userSupabase
+    const { data, error } = await supabase
       .from('user_wishlist')
       .insert({
         user_id: userId,
@@ -377,19 +319,13 @@ router.post('/wishlist/add', authenticateUser, async (req, res) => {
 router.delete('/wishlist/remove/:itemId', authenticateUser, async (req, res) => {
   try {
     const userId = req.user?.id;
-    const authHeader = req.headers.authorization;
-    const accessToken = authHeader?.substring(7);
-    
-    if (!userId || !accessToken) {
+    if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
     const { itemId } = req.params;
 
-    // Create user-scoped Supabase client for RLS to work
-    const userSupabase = getUserSupabaseClient(accessToken);
-
-    const { error } = await userSupabase
+    const { error } = await supabase
       .from('user_wishlist')
       .delete()
       .eq('id', itemId)
@@ -411,10 +347,7 @@ router.delete('/wishlist/remove/:itemId', authenticateUser, async (req, res) => 
 router.post('/wishlist/toggle', authenticateUser, async (req, res) => {
   try {
     const userId = req.user?.id;
-    const authHeader = req.headers.authorization;
-    const accessToken = authHeader?.substring(7);
-    
-    if (!userId || !accessToken) {
+    if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
@@ -424,11 +357,8 @@ router.post('/wishlist/toggle', authenticateUser, async (req, res) => {
       return res.status(400).json({ error: 'Service ID is required' });
     }
 
-    // Create user-scoped Supabase client for RLS to work
-    const userSupabase = getUserSupabaseClient(accessToken);
-
     // Check if item exists in wishlist
-    const { data: existingItem } = await userSupabase
+    const { data: existingItem } = await supabase
       .from('user_wishlist')
       .select('*')
       .eq('user_id', userId)
@@ -437,7 +367,7 @@ router.post('/wishlist/toggle', authenticateUser, async (req, res) => {
 
     if (existingItem) {
       // Remove from wishlist
-      const { error } = await userSupabase
+      const { error } = await supabase
         .from('user_wishlist')
         .delete()
         .eq('id', existingItem.id);
@@ -450,7 +380,7 @@ router.post('/wishlist/toggle', authenticateUser, async (req, res) => {
       res.json({ message: 'Item removed from wishlist', action: 'removed' });
     } else {
       // Add to wishlist
-      const { data, error } = await userSupabase
+      const { data, error } = await supabase
         .from('user_wishlist')
         .insert({
           user_id: userId,
@@ -476,17 +406,11 @@ router.post('/wishlist/toggle', authenticateUser, async (req, res) => {
 router.delete('/wishlist/clear', authenticateUser, async (req, res) => {
   try {
     const userId = req.user?.id;
-    const authHeader = req.headers.authorization;
-    const accessToken = authHeader?.substring(7);
-    
-    if (!userId || !accessToken) {
+    if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    // Create user-scoped Supabase client for RLS to work
-    const userSupabase = getUserSupabaseClient(accessToken);
-
-    const { error } = await userSupabase
+    const { error } = await supabase
       .from('user_wishlist')
       .delete()
       .eq('user_id', userId);
@@ -511,26 +435,20 @@ router.delete('/wishlist/clear', authenticateUser, async (req, res) => {
 router.get('/check-status/:serviceId', authenticateUser, async (req, res) => {
   try {
     const userId = req.user?.id;
-    const authHeader = req.headers.authorization;
-    const accessToken = authHeader?.substring(7);
-    
-    if (!userId || !accessToken) {
+    if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
     const { serviceId } = req.params;
 
-    // Create user-scoped Supabase client for RLS to work
-    const userSupabase = getUserSupabaseClient(accessToken);
-
     const [cartResult, wishlistResult] = await Promise.all([
-      userSupabase
+      supabase
         .from('user_cart')
         .select('id, quantity')
         .eq('user_id', userId)
         .eq('service_id', serviceId)
         .single(),
-      userSupabase
+      supabase
         .from('user_wishlist')
         .select('id')
         .eq('user_id', userId)

@@ -17,9 +17,13 @@ NODE_ENV=development
 # JWT Configuration
 JWT_SECRET=zyrxI/zivjSgRBXi0YsE7noWYTaUHBgCFS1tn8kkOvMo+1q2Jaic/tHuTnnBEri6So+7vw/FebFN2vEFCsFP6g==
 
-# Aadhaar API Configuration
-AADHAAR_API_URL=https://api.aadhaar.com/v1
-AADHAAR_API_KEY=your_aadhaar_api_key_here
+# Aadhaar Extraction (uses OpenRouter AI vision models)
+AADHAAR_API_PROVIDER=openrouter
+AADHAAR_API_KEY=your_openrouter_api_key_here
+# Vision model for document extraction (use a vision-capable model, not image-generation)
+OPENROUTER_MODEL=google/gemini-2.0-flash-exp:free
+OPENROUTER_SITE_URL=http://localhost:3001
+OPENROUTER_APP_NAME=S9-Aadhaar-Extractor
 
 # Email Configuration (SendGrid)
 SENDGRID_API_KEY=your_sendgrid_api_key_here
@@ -48,6 +52,9 @@ DB_CONNECTION_TIMEOUT=30000
 # Security Configuration
 BCRYPT_ROUNDS=12
 SESSION_SECRET=your_session_secret_here
+
+# Admin SQL execution (for run-sql script – create tables without SQL Editor)
+ADMIN_SECRET_KEY=your_admin_secret_here
 
 # CORS Configuration
 ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173
@@ -90,8 +97,8 @@ LOG_FILE=./logs/app.log
 - **PORT**: Server port (default: 3001)
 - **NODE_ENV**: Environment mode (development/production)
 - **JWT_SECRET**: Secret key for JWT token signing
-- **AADHAAR_API_URL**: Aadhaar verification API endpoint
-- **AADHAAR_API_KEY**: Aadhaar API authentication key
+- **AADHAAR_API_KEY**: OpenRouter API key (same as sk-or-v1-...) for Aadhaar image extraction
+- **OPENROUTER_MODEL**: Vision model for extraction. Use `google/gemini-2.0-flash-exp:free` for free vision; avoid image-generation models like gemini-3-pro-image-preview
 - **SENDGRID_API_KEY**: SendGrid API key for email services
 - **FROM_EMAIL**: Default sender email address
 - **RAZORPAY_KEY_ID**: Razorpay public key

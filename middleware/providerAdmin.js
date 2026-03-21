@@ -98,7 +98,7 @@ const createServiceProvider = async (req, res) => {
     // Auto-generate secure password
     const passwordPlain = generateTempPassword();
 
-    // Create Supabase Auth user (preferred)
+    // Create Supabase Auth user (required - login uses Supabase Auth)
     let authUserId = null;
     try {
       const { data: createdAuth, error: authErr } = await supabase.auth.admin.createUser({
@@ -110,18 +110,28 @@ const createServiceProvider = async (req, res) => {
       if (authErr) throw authErr;
       authUserId = createdAuth?.user?.id || null;
     } catch (authCreateErr) {
-      console.warn('Auth create failed, falling back to app users table only:', authCreateErr?.message || authCreateErr);
+      const msg = authCreateErr?.message || String(authCreateErr);
+      console.error('Auth create failed:', msg);
+      return res.status(500).json({
+        error: 'Failed to create login credentials. Service provider login uses Supabase Auth. ' + msg
+      });
     }
 
-    // Create application user row (id links to auth user when available)
+    // Create application user row (id and auth_user_id link to Supabase Auth)
     const appUserInsert = {
       email: normalizedEmail,
       role: 'service_provider',
-      status: 'pending_verification',
+      status: 'active', // Service providers created by admin should be active
+      // Admin-created service providers have verified email and phone
+      email_verified: true,
+      phone_verified: true,
       // keep legacy column satisfied for NOT NULL constraint
       password_hash: Buffer.from(passwordPlain).toString('base64')
     };
-    if (authUserId) appUserInsert.id = authUserId;
+    if (authUserId) {
+      appUserInsert.id = authUserId;
+      appUserInsert.auth_user_id = authUserId; // Link to Supabase Auth for login lookup
+    }
     const { data: user, error: userError } = await supabase
       .from('users')
       .insert(appUserInsert)
@@ -141,7 +151,7 @@ const createServiceProvider = async (req, res) => {
       specialization: specialization || null,
       service_category_id: service_category_id || null,
       service_id: service_id || null,
-      status: 'pending_verification',
+      status: 'pending_verification', // Admin sets this status manually - explicitly set to pending_verification
       created_by_admin: true,
       notes: notes || null
     };
@@ -165,7 +175,14 @@ const createServiceProvider = async (req, res) => {
 
     return res.status(201).json({
       message: 'Service provider created',
-      user: { id: user.id, email: user.email, role: 'service_provider', status: 'pending_verification' },
+      user: { 
+        id: user.id, 
+        email: user.email, 
+        role: 'service_provider', 
+        status: 'active',
+        email_verified: true,
+        phone_verified: true
+      },
       emailSent: Boolean(emailResult?.sent),
       emailSkipped: Boolean(emailResult?.skipped),
       emailError
@@ -203,18 +220,212 @@ const updateServiceProviderDetails = async (req, res) => {
   }
 };
 
-// List providers with profile and details
+// List providers with profile and details including profile pictures
 const listServiceProviders = async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('users')
-      .select(`id, email, role, status, created_at,
-               user_profiles(first_name, last_name, phone),
-               service_provider_details(specialization, service_category_id, service_id, status, created_at, updated_at)`) 
+      .select(`id, email, role, status, email_verified, phone_verified, created_at,
+               user_profiles!inner(first_name, last_name, phone),
+               service_provider_details!inner(specialization, service_category_id, service_id, status, created_at, updated_at, created_by_admin, notes),
+               provider_profiles(profile_photo_url, bio, qualifications, certifications, languages, hourly_rate, years_of_experience, city, state, pincode)`) 
       .eq('role', 'service_provider')
       .order('created_at', { ascending: false });
+    
     if (error) return res.status(500).json({ error: error.message });
-    return res.json({ providers: data || [] });
+    
+    // Transform the data to make it more accessible
+    const transformedProviders = (data || []).map(provider => ({
+      id: provider.id,
+      email: provider.email,
+      role: provider.role,
+      status: provider.status,
+      email_verified: provider.email_verified,
+      phone_verified: provider.phone_verified,
+      created_at: provider.created_at,
+      // User profile data (using !inner join, so it's a single object)
+      first_name: provider.user_profiles?.first_name || null,
+      last_name: provider.user_profiles?.last_name || null,
+      phone: provider.user_profiles?.phone || null,
+      // Service provider details (using !inner join, so it's a single object)
+      specialization: provider.service_provider_details?.specialization || null,
+      service_category_id: provider.service_provider_details?.service_category_id || null,
+      service_id: provider.service_provider_details?.service_id || null,
+      provider_status: provider.service_provider_details?.status || null,
+      created_by_admin: provider.service_provider_details?.created_by_admin || false,
+      notes: provider.service_provider_details?.notes || null,
+      // Provider profile data (including profile picture) - this is optional, so it might be an array
+      profile_photo_url: provider.provider_profiles?.[0]?.profile_photo_url || provider.provider_profiles?.profile_photo_url || null,
+      bio: provider.provider_profiles?.[0]?.bio || provider.provider_profiles?.bio || null,
+      qualifications: provider.provider_profiles?.[0]?.qualifications || provider.provider_profiles?.qualifications || [],
+      certifications: provider.provider_profiles?.[0]?.certifications || provider.provider_profiles?.certifications || [],
+      languages: provider.provider_profiles?.[0]?.languages || provider.provider_profiles?.languages || [],
+      hourly_rate: provider.provider_profiles?.[0]?.hourly_rate || provider.provider_profiles?.hourly_rate || null,
+      years_of_experience: provider.provider_profiles?.[0]?.years_of_experience || provider.provider_profiles?.years_of_experience || null,
+      city: provider.provider_profiles?.[0]?.city || provider.provider_profiles?.city || null,
+      state: provider.provider_profiles?.[0]?.state || provider.provider_profiles?.state || null,
+      pincode: provider.provider_profiles?.[0]?.pincode || provider.provider_profiles?.pincode || null
+    }));
+    
+    return res.json({ 
+      providers: transformedProviders,
+      total: transformedProviders.length
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+// Admin endpoint: resend/fix provider credentials (creates Auth user if missing)
+const resendProviderCredentials = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { sendEmail = true } = req.body || {};
+
+    if (!userId) return res.status(400).json({ error: 'User ID is required' });
+
+    const { data: user, error: userErr } = await supabase
+      .from('users')
+      .select('id, email, auth_user_id, user_profiles!inner(first_name, last_name)')
+      .eq('role', 'service_provider')
+      .eq('id', userId)
+      .single();
+
+    if (userErr || !user) return res.status(404).json({ error: 'Service provider not found' });
+
+    const normalizedEmail = String(user.email).toLowerCase().trim();
+    const fullName = [user.user_profiles?.first_name, user.user_profiles?.last_name].filter(Boolean).join(' ');
+    const passwordPlain = generateTempPassword();
+
+    // Create or update Supabase Auth user
+    let authUserId = user.auth_user_id;
+    try {
+      const { data: authLookup } = await supabase.auth.admin.getUserByEmail(normalizedEmail);
+      const existingAuthUser = authLookup?.user;
+
+      if (existingAuthUser) {
+        await supabase.auth.admin.updateUserById(existingAuthUser.id, { password: passwordPlain });
+        authUserId = existingAuthUser.id;
+      } else {
+        const { data: createdAuth, error: authErr } = await supabase.auth.admin.createUser({
+          email: normalizedEmail,
+          password: passwordPlain,
+          email_confirm: true,
+          user_metadata: { role: 'service_provider' }
+        });
+        if (authErr) throw authErr;
+        authUserId = createdAuth?.user?.id || null;
+      }
+    } catch (authErr) {
+      const msg = authErr?.message || String(authErr);
+      console.error('Auth create/update failed:', msg);
+      return res.status(500).json({
+        error: 'Failed to set login credentials. ' + msg
+      });
+    }
+
+    // Update users table: password_hash and auth_user_id
+    const { error: updateErr } = await supabase
+      .from('users')
+      .update({
+        password_hash: Buffer.from(passwordPlain).toString('base64'),
+        auth_user_id: authUserId
+      })
+      .eq('id', userId);
+
+    if (updateErr) return res.status(500).json({ error: updateErr.message });
+
+    // Send credentials email if requested
+    let emailResult = { skipped: !sendEmail };
+    let emailError = null;
+    if (sendEmail) {
+      try {
+        emailResult = await sendProviderCredentialsEmail({
+          to: normalizedEmail,
+          email: normalizedEmail,
+          password: passwordPlain,
+          fullName: fullName || 'Service Provider'
+        });
+      } catch (mailErr) {
+        console.warn('Email send failed:', mailErr?.message || mailErr);
+        emailError = mailErr?.message || 'Email send failed';
+      }
+    }
+
+    return res.json({
+      message: 'Credentials updated successfully',
+      emailSent: Boolean(emailResult?.sent),
+      emailError,
+      tempPassword: !sendEmail || emailError ? passwordPlain : undefined
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// Get single service provider with full profile data including profile picture
+const getServiceProvider = async (req, res) => {
+  try {
+    const { providerId } = req.params;
+    
+    if (!providerId) {
+      return res.status(400).json({ error: 'Provider ID is required' });
+    }
+
+    const { data, error } = await supabase
+      .from('users')
+      .select(`id, email, role, status, email_verified, phone_verified, created_at,
+               user_profiles!inner(first_name, last_name, phone),
+               service_provider_details!inner(specialization, service_category_id, service_id, status, created_at, updated_at, created_by_admin, notes),
+               provider_profiles(profile_photo_url, bio, qualifications, certifications, languages, hourly_rate, years_of_experience, city, state, pincode, address, location_latitude, location_longitude)`) 
+      .eq('role', 'service_provider')
+      .eq('id', providerId)
+      .single();
+    
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Service provider not found' });
+      }
+      return res.status(500).json({ error: error.message });
+    }
+    
+    // Transform the data
+    const transformedProvider = {
+      id: data.id,
+      email: data.email,
+      role: data.role,
+      status: data.status,
+      email_verified: data.email_verified,
+      phone_verified: data.phone_verified,
+      created_at: data.created_at,
+      // User profile data (using !inner join, so it's a single object)
+      first_name: data.user_profiles?.first_name || null,
+      last_name: data.user_profiles?.last_name || null,
+      phone: data.user_profiles?.phone || null,
+      // Service provider details (using !inner join, so it's a single object)
+      specialization: data.service_provider_details?.specialization || null,
+      service_category_id: data.service_provider_details?.service_category_id || null,
+      service_id: data.service_provider_details?.service_id || null,
+      provider_status: data.service_provider_details?.status || null,
+      created_by_admin: data.service_provider_details?.created_by_admin || false,
+      notes: data.service_provider_details?.notes || null,
+      // Provider profile data (including profile picture) - this is optional, so it might be an array
+      profile_photo_url: data.provider_profiles?.[0]?.profile_photo_url || data.provider_profiles?.profile_photo_url || null,
+      bio: data.provider_profiles?.[0]?.bio || data.provider_profiles?.bio || null,
+      qualifications: data.provider_profiles?.[0]?.qualifications || data.provider_profiles?.qualifications || [],
+      certifications: data.provider_profiles?.[0]?.certifications || data.provider_profiles?.certifications || [],
+      languages: data.provider_profiles?.[0]?.languages || data.provider_profiles?.languages || [],
+      hourly_rate: data.provider_profiles?.[0]?.hourly_rate || data.provider_profiles?.hourly_rate || null,
+      years_of_experience: data.provider_profiles?.[0]?.years_of_experience || data.provider_profiles?.years_of_experience || null,
+      city: data.provider_profiles?.[0]?.city || data.provider_profiles?.city || null,
+      state: data.provider_profiles?.[0]?.state || data.provider_profiles?.state || null,
+      pincode: data.provider_profiles?.[0]?.pincode || data.provider_profiles?.pincode || null,
+      address: data.provider_profiles?.[0]?.address || data.provider_profiles?.address || null,
+      location_latitude: data.provider_profiles?.[0]?.location_latitude || data.provider_profiles?.location_latitude || null,
+      location_longitude: data.provider_profiles?.[0]?.location_longitude || data.provider_profiles?.location_longitude || null
+    };
+    
+    return res.json({ provider: transformedProvider });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -223,7 +434,9 @@ const listServiceProviders = async (req, res) => {
 module.exports = {
   createServiceProvider,
   updateServiceProviderDetails,
-  listServiceProviders
+  listServiceProviders,
+  getServiceProvider,
+  resendProviderCredentials
 };
 
 

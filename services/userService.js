@@ -145,17 +145,26 @@ class UserService {
   // Create new user with role
   async createUser(userData) {
     try {
-      const { email, password_hash, role, first_name, last_name, phone } = userData;
+      const { email, password_hash, role, first_name, last_name, phone, created_by_admin = false } = userData;
+
+      // Prepare user data
+      const userInsertData = {
+        email,
+        password_hash,
+        role,
+        status: role === 'service_provider' ? 'active' : 'pending_verification' // Service providers default to active
+      };
+
+      // If created by admin, mark email and phone as verified
+      if (created_by_admin) {
+        userInsertData.email_verified = true;
+        userInsertData.phone_verified = true;
+      }
 
       // Start a transaction
       const { data: user, error: userError } = await this.supabase
         .from('users')
-        .insert({
-          email,
-          password_hash,
-          role,
-          status: 'pending_verification'
-        })
+        .insert(userInsertData)
         .select()
         .single();
 
@@ -186,7 +195,10 @@ class UserService {
         case 'service_provider':
           const { error: providerError } = await this.supabase
             .from('service_provider_details')
-            .insert({ id: user.id });
+            .insert({ 
+              id: user.id,
+              status: 'pending_verification' // Explicitly set to pending_verification
+            });
           roleDetailsError = providerError;
           break;
 
@@ -296,15 +308,52 @@ class UserService {
   // Get all users regardless of status
   async getAllUsers() {
     try {
-      const { data, error } = await this.supabase
+      // First get all users with their profiles
+      const { data: users, error: usersError } = await this.supabase
         .from('users')
         .select(`
           *,
-          user_profiles (*)
+          user_profiles (*),
+          service_provider_details (*)
         `);
 
-      if (error) throw error;
-      return data;
+      if (usersError) throw usersError;
+      
+      // For service providers, get their provider profiles separately
+      const serviceProviderIds = users
+        .filter(user => user.role === 'service_provider')
+        .map(user => user.id);
+      
+      let providerProfiles = {};
+      if (serviceProviderIds.length > 0) {
+        const { data: profiles, error: profilesError } = await this.supabase
+          .from('provider_profiles')
+          .select('*')
+          .in('provider_id', serviceProviderIds);
+        
+        if (profilesError) {
+          console.warn('Failed to fetch provider profiles:', profilesError);
+        } else {
+          // Create a map for easy lookup
+          profiles.forEach(profile => {
+            providerProfiles[profile.provider_id] = profile;
+          });
+        }
+      }
+      
+      // Transform the data to include provider profiles
+      const transformedData = users.map(user => {
+        const transformedUser = { ...user };
+        
+        // For service providers, add provider profile data
+        if (user.role === 'service_provider') {
+          transformedUser.provider_profile = providerProfiles[user.id] || null;
+        }
+        
+        return transformedUser;
+      });
+      
+      return transformedData;
     } catch (error) {
       throw new Error(`Failed to get all users: ${error.message}`);
     }

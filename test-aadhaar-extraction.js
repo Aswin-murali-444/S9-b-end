@@ -53,7 +53,7 @@ async function testApiConnectivity() {
     
     // Check if the configured model is available
     const models = response.data?.data || [];
-    const configuredModel = process.env.OPENROUTER_MODEL || 'google/gemini-2.5-flash-image';
+    const configuredModel = process.env.OPENROUTER_MODEL || 'google/gemini-3-pro-image-preview';
     const modelExists = models.some(model => model.id === configuredModel);
     
     console.log('Configured model available:', modelExists ? '✅ YES' : '❌ NO');

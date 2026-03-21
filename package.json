@@ -21,7 +21,9 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "run-sql": "node scripts/run-sql.js",
+    "create-test-table": "node scripts/run-sql.js create-test-table-manual.sql"
   },
   "keywords": [],
   "author": "",

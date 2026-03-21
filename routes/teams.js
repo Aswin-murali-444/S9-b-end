@@ -1,8 +1,218 @@
 const express = require('express');
 const router = express.Router();
 const { supabase } = require('../lib/supabase');
+const { sendTeamCreationNotifications } = require('../services/notificationService');
 
-// Create a new team
+// Create a new team with existing providers
+const createTeamWithExistingProviders = async (req, res) => {
+  try {
+    const { 
+      name, 
+      description, 
+      team_leader_id, // ID of existing provider to be team leader
+      service_category_id, 
+      service_id, 
+      max_members = 10,
+      team_member_ids = [] // Array of existing provider IDs
+    } = req.body;
+
+    if (!name || !team_leader_id) {
+      return res.status(400).json({ error: 'Team name and team leader ID are required' });
+    }
+
+    // Verify team leader exists and is a service provider
+    const { data: teamLeader, error: leaderError } = await supabase
+      .from('users')
+      .select(`
+        id,
+        email,
+        role,
+        status,
+        user_profiles(first_name, last_name, phone),
+        service_provider_details(specialization, service_category_id, service_id, status)
+      `)
+      .eq('id', team_leader_id)
+      .eq('role', 'service_provider')
+      .single();
+
+    if (leaderError || !teamLeader) {
+      return res.status(400).json({ error: 'Team leader not found or not a service provider' });
+    }
+
+    // Check if team leader is already part of another team
+    const { data: existingLeaderTeam, error: leaderTeamError } = await supabase
+      .from('team_members')
+      .select('team_id, teams(name)')
+      .eq('user_id', team_leader_id)
+      .eq('status', 'active')
+      .single();
+
+    if (existingLeaderTeam) {
+      return res.status(400).json({ 
+        error: `Team leader is already part of team "${existingLeaderTeam.teams.name}". Service providers can only be part of one team at a time.` 
+      });
+    }
+
+    // Verify all team members exist and are service providers
+    if (team_member_ids.length > 0) {
+      const { data: teamMembers, error: membersError } = await supabase
+        .from('users')
+        .select(`
+          id,
+          email,
+          role,
+          status,
+          user_profiles(first_name, last_name, phone),
+          service_provider_details(specialization, service_category_id, service_id, status)
+        `)
+        .in('id', team_member_ids)
+        .eq('role', 'service_provider');
+
+      if (membersError || !teamMembers || teamMembers.length !== team_member_ids.length) {
+        return res.status(400).json({ error: 'One or more team members not found or not service providers' });
+      }
+
+      // Check if any team members are already part of other teams
+      const { data: existingMemberTeams, error: memberTeamError } = await supabase
+        .from('team_members')
+        .select('user_id, teams(name)')
+        .in('user_id', team_member_ids)
+        .eq('status', 'active');
+
+      if (existingMemberTeams && existingMemberTeams.length > 0) {
+        const conflictingMembers = existingMemberTeams.map(member => member.teams.name).join(', ');
+        return res.status(400).json({ 
+          error: `One or more team members are already part of other teams (${conflictingMembers}). Service providers can only be part of one team at a time.` 
+        });
+      }
+    }
+
+    // Create the team
+    const { data: team, error: teamError } = await supabase
+      .from('teams')
+      .insert({
+        name,
+        description,
+        team_leader_id,
+        service_category_id: service_category_id || null,
+        service_id: service_id || null,
+        max_members,
+        status: 'active'
+      })
+      .select()
+      .single();
+
+    if (teamError) {
+      return res.status(500).json({ error: teamError.message });
+    }
+
+    // Add team members to team_members table
+    // Ensure team leader is a member (DB trigger may or may not exist)
+    const { error: leaderMemberError } = await supabase
+      .from('team_members')
+      .upsert(
+        [{ team_id: team.id, user_id: team_leader_id, role: 'leader', status: 'active' }],
+        { onConflict: 'team_id,user_id' }
+      );
+
+    if (leaderMemberError) {
+      await supabase.from('teams').delete().eq('id', team.id);
+      return res.status(500).json({ error: 'Failed to add team leader as member: ' + leaderMemberError.message });
+    }
+
+    const membersToAdd = team_member_ids
+      .filter(memberId => memberId !== team_leader_id) // Filter out team leader to avoid duplicate
+      .map(memberId => ({
+        team_id: team.id,
+        user_id: memberId,
+        role: 'member',
+        status: 'active'
+      }));
+
+    if (membersToAdd.length > 0) {
+      const { error: membersError } = await supabase
+        .from('team_members')
+        .upsert(membersToAdd, { onConflict: 'team_id,user_id' });
+
+      if (membersError) {
+        // Clean up team if adding members fails
+        await supabase.from('teams').delete().eq('id', team.id);
+        return res.status(500).json({ error: 'Failed to add team members: ' + membersError.message });
+      }
+    }
+
+    // Fetch the complete team data with members
+    const { data: completeTeam, error: fetchError } = await supabase
+      .from('teams')
+      .select(`
+        *,
+        team_members(
+          id,
+          role,
+          status,
+          joined_at,
+          user_id,
+          users:user_id(
+            id,
+            email,
+            user_profiles(first_name, last_name, phone)
+          )
+        ),
+        team_leaders:team_leader_id(
+          id,
+          email,
+          user_profiles(first_name, last_name, phone)
+        ),
+        service_categories(name),
+        services(name)
+      `)
+      .eq('id', team.id)
+      .single();
+
+    if (fetchError) {
+      return res.status(500).json({ error: 'Failed to fetch team data: ' + fetchError.message });
+    }
+
+    // Send notifications to all team members
+    try {
+      const teamMembersForNotification = [
+        { user_id: team_leader_id, role: 'leader' },
+        ...team_member_ids
+          .filter(memberId => memberId !== team_leader_id)
+          .map(memberId => ({ user_id: memberId, role: 'member' }))
+      ];
+
+      const notificationResults = await sendTeamCreationNotifications(
+        teamMembersForNotification,
+        {
+          id: team.id,
+          name: team.name,
+          description: team.description,
+          max_members: team.max_members,
+          service_category: completeTeam.service_categories?.name || 'General',
+          service_name: completeTeam.services?.name || 'Team Service'
+        }
+      );
+
+      console.log('Team creation notifications sent:', notificationResults);
+    } catch (notificationError) {
+      console.error('Failed to send team creation notifications:', notificationError);
+      // Don't fail the team creation if notifications fail
+    }
+
+    return res.status(201).json({
+      message: 'Team created successfully',
+      team: completeTeam,
+      memberCount: 1 + membersToAdd.length
+    });
+
+  } catch (error) {
+    console.error('Error creating team with existing providers:', error);
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+// Create a new team (original method for creating new accounts)
 const createTeam = async (req, res) => {
   try {
     const { 
@@ -118,7 +328,7 @@ const createTeam = async (req, res) => {
       }
     }
 
-    // Add team leader and members to team_members table
+    // Add team leader and members to team_members table (robust even if DB trigger is missing)
     const membersToAdd = [
       { team_id: team.id, user_id: team_leader_id, role: 'leader', status: 'active' },
       ...createdMembers
@@ -126,7 +336,7 @@ const createTeam = async (req, res) => {
 
     const { error: membersError } = await supabase
       .from('team_members')
-      .insert(membersToAdd);
+      .upsert(membersToAdd, { onConflict: 'team_id,user_id' });
 
     if (membersError) {
       // Clean up created accounts if adding to team fails
@@ -342,10 +552,29 @@ const addTeamMember = async (req, res) => {
       return res.status(400).json({ error: 'Invalid user. Must be a service provider.' });
     }
 
+    // Enforce: service providers can only be part of one active team at a time
+    const { data: existingMembershipRows, error: membershipError } = await supabase
+      .from('team_members')
+      .select('team_id, teams(name)')
+      .eq('user_id', user_id)
+      .eq('status', 'active')
+      .limit(1);
+
+    if (membershipError) {
+      return res.status(500).json({ error: membershipError.message });
+    }
+
+    const existingMembership = (existingMembershipRows || [])[0];
+    if (existingMembership && existingMembership.team_id && existingMembership.team_id !== teamId) {
+      return res.status(400).json({
+        error: `User is already part of team "${existingMembership.teams?.name || existingMembership.team_id}". Service providers can only be part of one team at a time.`
+      });
+    }
+
     // Check if team exists and has space
     const { data: team, error: teamError } = await supabase
       .from('teams')
-      .select('max_members')
+      .select('id, max_members, team_leader_id')
       .eq('id', teamId)
       .single();
 
@@ -362,6 +591,11 @@ const addTeamMember = async (req, res) => {
 
     if (currentCount >= team.max_members) {
       return res.status(400).json({ error: 'Team has reached maximum capacity' });
+    }
+
+    // Prevent downgrading/overwriting leader role via member insert
+    if (team.team_leader_id === user_id) {
+      return res.status(400).json({ error: 'User is already the team leader and should already be in the team.' });
     }
 
     // Add member
@@ -517,12 +751,67 @@ const getProviderTeamMembers = async (req, res) => {
   try {
     const { providerId } = req.params;
 
-    if (!providerId) {
-      return res.status(400).json({ error: 'Provider ID is required' });
+    // First, check if the provider is a team leader
+    const { data: teamAsLeader, error: leaderError } = await supabase
+      .from('teams')
+      .select(`
+        id,
+        name,
+        description,
+        team_members(
+          id,
+          role,
+          status,
+          joined_at,
+          user_id,
+          users:user_id(
+            id,
+            email,
+            user_profiles(first_name, last_name, phone),
+            service_provider_details(specialization, service_category_id, service_id, status)
+          )
+        )
+      `)
+      .eq('team_leader_id', providerId)
+      .eq('status', 'active')
+      .single();
+
+    if (leaderError && leaderError.code !== 'PGRST116') {
+      return res.status(500).json({ error: leaderError.message });
     }
 
-    // Find the team where this provider is a member
-    const { data: teamMembers, error: teamMembersError } = await supabase
+    // If provider is a team leader, return team members
+    if (teamAsLeader) {
+      const teamMembers = teamAsLeader.team_members?.map(member => ({
+        id: member.id,
+        user_id: member.user_id,
+        role: member.role,
+        status: member.status,
+        joined_at: member.joined_at,
+        first_name: member.users?.user_profiles?.first_name || '',
+        last_name: member.users?.user_profiles?.last_name || '',
+        email: member.users?.email || '',
+        phone: member.users?.user_profiles?.phone || '',
+        specialization: member.users?.service_provider_details?.specialization || '',
+        service_category_id: member.users?.service_provider_details?.service_category_id,
+        service_id: member.users?.service_provider_details?.service_id,
+        provider_status: member.users?.service_provider_details?.status || 'active'
+      })) || [];
+
+      return res.json({
+        success: true,
+        data: {
+          team_id: teamAsLeader.id,
+          team_name: teamAsLeader.name,
+          team_description: teamAsLeader.description,
+          team_members: teamMembers,
+          is_team_leader: true
+        }
+      });
+    }
+
+    // If not a team leader, check if provider is a team member
+    const { data: teamMembership, error: memberError } = await supabase
       .from('team_members')
       .select(`
         id,
@@ -530,124 +819,84 @@ const getProviderTeamMembers = async (req, res) => {
         status,
         joined_at,
         team_id,
-        teams:team_id(
+        teams(
           id,
           name,
-          description
-        )
-      `)
-      .eq('user_id', providerId)
-      .eq('status', 'active');
-
-    if (teamMembersError) {
-      console.error('Error fetching team members:', teamMembersError);
-      return res.status(500).json({ error: teamMembersError.message });
-    }
-
-    if (!teamMembers || teamMembers.length === 0) {
-      return res.json({
-        success: true,
-        data: {
-          team_members: []
-        }
-      });
-    }
-
-    // Get the team ID (assuming provider is in one team)
-    const teamId = teamMembers[0].team_id;
-
-    // Get all members of this team
-    const { data: allTeamMembers, error: allMembersError } = await supabase
-      .from('team_members')
-      .select(`
-        id,
-        role,
-        status,
-        joined_at,
-        user_id,
-        users:user_id(
-          id,
-          email,
-          user_profiles(
-            first_name,
-            last_name,
-            phone
-          ),
-          service_provider_details(
-            specialization,
-            experience_years,
-            service_category_id,
-            service_categories:service_category_id(
-              name
+          description,
+          team_leader_id,
+          team_members(
+            id,
+            role,
+            status,
+            joined_at,
+            user_id,
+            users:user_id(
+              id,
+              email,
+              user_profiles(first_name, last_name, phone),
+              service_provider_details(specialization, service_category_id, service_id, status)
             )
           )
         )
       `)
-      .eq('team_id', teamId)
-      .eq('status', 'active');
+      .eq('user_id', providerId)
+      .eq('status', 'active')
+      .single();
 
-    if (allMembersError) {
-      console.error('Error fetching all team members:', allMembersError);
-      return res.status(500).json({ error: allMembersError.message });
+    if (memberError && memberError.code !== 'PGRST116') {
+      return res.status(500).json({ error: memberError.message });
     }
 
-    // Format team members data
-    const formattedMembers = (allTeamMembers || []).map(member => {
-      const user = member.users;
-      // Handle user_profiles - could be array or single object
-      const profile = Array.isArray(user?.user_profiles) 
-        ? user.user_profiles[0] 
-        : user?.user_profiles || {};
-      
-      // Handle service_provider_details - could be array or single object
-      const providerDetails = Array.isArray(user?.service_provider_details) 
-        ? user.service_provider_details[0] 
-        : user?.service_provider_details || {};
-      
-      // Handle service_categories - could be array or single object
-      const category = Array.isArray(providerDetails?.service_categories) 
-        ? providerDetails.service_categories[0] 
-        : providerDetails?.service_categories || {};
-
-      return {
+    if (teamMembership) {
+      const teamMembers = teamMembership.teams.team_members?.map(member => ({
         id: member.id,
         user_id: member.user_id,
-        first_name: profile.first_name || '',
-        last_name: profile.last_name || '',
-        name: `${profile.first_name || ''} ${profile.last_name || ''}`.trim() || 'Unknown',
-        email: user?.email || '',
-        phone: profile.phone || '',
-        role: member.role || 'member',
-        status: member.status || 'active',
-        specialization: providerDetails.specialization || '',
-        service_category_name: category.name || '',
-        experience_years: providerDetails.experience_years || 0,
-        joined_date: member.joined_at || null,
-        created_at: member.joined_at || null
-      };
-    });
+        role: member.role,
+        status: member.status,
+        joined_at: member.joined_at,
+        first_name: member.users?.user_profiles?.first_name || '',
+        last_name: member.users?.user_profiles?.last_name || '',
+        email: member.users?.email || '',
+        phone: member.users?.user_profiles?.phone || '',
+        specialization: member.users?.service_provider_details?.specialization || '',
+        service_category_id: member.users?.service_provider_details?.service_category_id,
+        service_id: member.users?.service_provider_details?.service_id,
+        provider_status: member.users?.service_provider_details?.status || 'active'
+      })) || [];
 
-    // Handle teams relationship - could be array or single object
-    const team = Array.isArray(teamMembers[0]?.teams) 
-      ? teamMembers[0].teams[0] 
-      : teamMembers[0]?.teams || null;
+      return res.json({
+        success: true,
+        data: {
+          team_id: teamMembership.teams.id,
+          team_name: teamMembership.teams.name,
+          team_description: teamMembership.teams.description,
+          team_members: teamMembers,
+          is_team_leader: teamMembership.teams.team_leader_id === providerId
+        }
+      });
+    }
 
-    res.json({
+    // Provider is not part of any team
+    return res.json({
       success: true,
       data: {
-        team_members: formattedMembers,
-        team: team
+        team_id: null,
+        team_name: null,
+        team_description: null,
+        team_members: [],
+        is_team_leader: false
       }
     });
 
   } catch (error) {
-    console.error('Get provider team members error:', error);
-    res.status(500).json({ error: error.message || 'Failed to get provider team members' });
+    console.error('Error fetching provider team members:', error);
+    return res.status(500).json({ error: error.message });
   }
 };
 
 // Routes
 router.post('/', createTeam);
+router.post('/with-existing-providers', createTeamWithExistingProviders);
 router.get('/', getTeams);
 router.get('/available-providers', getAvailableProviders);
 router.get('/provider/:providerId/team', getProviderTeamMembers);

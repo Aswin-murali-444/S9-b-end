@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { supabase } = require('../lib/supabase');
+const { recommendServicesForUser } = require('../services/mlService');
 
 // List services with category information
 router.get('/', async (req, res) => {
@@ -22,6 +23,8 @@ router.get('/', async (req, res) => {
         created_at, 
         updated_at,
         category_id,
+        rating,
+        review_count,
         service_categories!inner(
           id,
           name
@@ -41,6 +44,264 @@ router.get('/', async (req, res) => {
     res.json(formattedServices);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Recommend services for a user (for dashboards / booking page)
+router.get('/user/:userId/recommendations', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const limit = parseInt(req.query.limit || '5', 10);
+    const currentServiceId = req.query.currentServiceId || req.query.current_service_id || null;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    // Resolve auth_user_id -> users.id so we can query bookings/customer_details correctly
+    // (frontend might pass auth UID, while bookings.user_id is likely users.id).
+    let resolvedUserId = userId;
+    try {
+      const { data: userRow, error: userRowErr } = await supabase
+        .from('users')
+        .select('id')
+        .eq('auth_user_id', userId)
+        .maybeSingle();
+
+      if (!userRowErr && userRow?.id) resolvedUserId = userRow.id;
+    } catch (e) {
+      // Non-blocking; we'll fall back to userId as-is.
+      resolvedUserId = userId;
+    }
+
+    // Fetch this user's recent booking history
+    const { data: userBookings, error: userErr } = await supabase
+      .from('bookings')
+      .select('id, user_id, service_id')
+      .eq('user_id', resolvedUserId)
+      .neq('booking_status', 'cancelled')
+      .not('service_id', 'is', null)
+      .order('created_at', { ascending: true })
+      .limit(200);
+
+    if (userErr) {
+      console.error('Error fetching user bookings for recommendations:', userErr);
+      return res.status(500).json({ error: 'Failed to fetch user bookings' });
+    }
+
+    let userHistory = (userBookings || [])
+      .map((b) => b.service_id)
+      .filter((sid) => !!sid);
+
+    // Cold-start fallback: if the user has no booking history yet,
+    // use onboarding preferences from customer_details.preferred_services.
+    if (userHistory.length === 0) {
+      const isUuid = (v) =>
+        typeof v === 'string' &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
+
+      try {
+        const { data: customerRow, error: customerErr } = await supabase
+          .from('customer_details')
+          .select('preferred_services')
+          .eq('id', resolvedUserId)
+          .maybeSingle();
+
+        if (!customerErr && customerRow?.preferred_services) {
+          const rawPrefs = Array.isArray(customerRow.preferred_services)
+            ? customerRow.preferred_services
+            : [];
+
+          const prefStrings = rawPrefs.filter(Boolean).map((x) => String(x));
+          if (prefStrings.length > 0) {
+            const uuidPrefs = prefStrings.filter(isUuid);
+            const namePrefs = prefStrings.filter((p) => !isUuid(p));
+
+            // If preferences already look like service IDs, use them directly.
+            if (uuidPrefs.length === prefStrings.length) {
+              userHistory = uuidPrefs;
+            } else if (namePrefs.length > 0) {
+              // Map service names -> service IDs (best-effort for older/onboarding docs).
+              const serviceRows = await supabase
+                .from('services')
+                .select('id, name')
+                .in('name', namePrefs);
+
+              const byName = {};
+              (serviceRows || []).forEach((s) => {
+                if (s?.name) byName[s.name] = s.id;
+              });
+
+              const mappedByName = namePrefs.map((n) => byName[n]).filter(Boolean);
+              userHistory = [...new Set([...uuidPrefs, ...mappedByName])];
+            } else {
+              userHistory = uuidPrefs;
+            }
+          }
+        }
+      } catch (e) {
+        // Non-blocking: ML will fall back to popularity if userHistory stays empty.
+        console.warn('Cold-start preferred_services fallback failed:', e?.message || e);
+      }
+    }
+
+    // Fetch a global sample of bookings to build co-occurrence and popularity
+    const { data: globalBookings, error: globalErr } = await supabase
+      .from('bookings')
+      .select('user_id, service_id')
+      .neq('booking_status', 'cancelled')
+      .not('service_id', 'is', null)
+      .order('created_at', { ascending: true })
+      .limit(1000);
+
+    if (globalErr) {
+      console.error('Error fetching global bookings for recommendations:', globalErr);
+      return res.status(500).json({ error: 'Failed to fetch global bookings' });
+    }
+
+    const globalCooccurrence = {};
+    const popularityCounts = {};
+    const bookingsByUser = {};
+
+    for (const b of globalBookings || []) {
+      if (!b.user_id || !b.service_id) continue;
+      const uid = String(b.user_id);
+      if (!bookingsByUser[uid]) bookingsByUser[uid] = [];
+      bookingsByUser[uid].push(String(b.service_id));
+      popularityCounts[String(b.service_id)] = (popularityCounts[String(b.service_id)] || 0) + 1;
+    }
+
+    // Build co-occurrence matrix at user level (services that co-occur for same user)
+    Object.values(bookingsByUser).forEach((serviceList) => {
+      const uniqueServices = Array.from(new Set(serviceList));
+      for (let i = 0; i < uniqueServices.length; i += 1) {
+        for (let j = 0; j < uniqueServices.length; j += 1) {
+          if (i === j) continue;
+          const a = uniqueServices[i];
+          const b = uniqueServices[j];
+          if (!globalCooccurrence[a]) globalCooccurrence[a] = {};
+          globalCooccurrence[a][b] = (globalCooccurrence[a][b] || 0) + 1;
+        }
+      }
+    });
+
+    const popularServices = Object.entries(popularityCounts)
+      .sort(([, aCount], [, bCount]) => bCount - aCount)
+      .map(([serviceId, count]) => ({ service_id: serviceId, count }));
+
+    const payload = {
+      user_id: resolvedUserId,
+      current_service_id: currentServiceId,
+      user_history: userHistory,
+      global_cooccurrence: globalCooccurrence,
+      popular_services: popularServices,
+      limit: Number.isFinite(limit) && limit > 0 ? limit : 5
+    };
+
+    const { data: mlData, error: mlError } = await recommendServicesForUser(payload);
+
+    if (mlError || !mlData) {
+      console.error('ML recommend-services failed, falling back to popularity:', mlError);
+      // Simple popularity-based fallback excluding already used services
+      const usedSet = new Set(userHistory.map(String));
+      const fallback = popularServices
+        .filter((p) => !usedSet.has(String(p.service_id)))
+        .slice(0, payload.limit)
+        .map((p) => ({
+          service_id: p.service_id,
+          score: p.count
+        }));
+
+      if (!fallback.length) {
+        return res.json({
+          userId,
+          currentServiceId,
+          recommendations: [],
+          usedMlService: false
+        });
+      }
+
+      const serviceIds = fallback.map((r) => r.service_id);
+      const { data: serviceRows } = await supabase
+        .from('services')
+        .select('id, name, description, icon_url, duration, price, offer_price, offer_enabled, category_id')
+        .in('id', serviceIds);
+
+      const serviceById = {};
+      (serviceRows || []).forEach((s) => {
+        serviceById[s.id] = s;
+      });
+
+      const recommendations = fallback.map((r) => {
+        const s = serviceById[r.service_id] || {};
+        return {
+          serviceId: r.service_id,
+          score: r.score,
+          name: s.name || '',
+          description: s.description || '',
+          icon_url: s.icon_url || null,
+          duration: s.duration,
+          price: s.price,
+          offer_price: s.offer_price,
+          offer_enabled: s.offer_enabled,
+          category_id: s.category_id
+        };
+      });
+
+      return res.json({
+        userId,
+        currentServiceId,
+        recommendations,
+        usedMlService: false
+      });
+    }
+
+    const recommendedList = mlData.recommendations || [];
+    if (!recommendedList.length) {
+      return res.json({
+        userId,
+        currentServiceId,
+        recommendations: [],
+        usedMlService: true
+      });
+    }
+
+    const serviceIds = recommendedList.map((r) => r.service_id);
+    const { data: serviceRows } = await supabase
+      .from('services')
+      .select('id, name, description, icon_url, duration, price, offer_price, offer_enabled, category_id')
+      .in('id', serviceIds);
+
+    const serviceById = {};
+    (serviceRows || []).forEach((s) => {
+      serviceById[s.id] = s;
+    });
+
+    const recommendations = recommendedList.map((r) => {
+      const s = serviceById[r.service_id] || {};
+      return {
+        serviceId: r.service_id,
+        score: r.score,
+        name: s.name || '',
+        description: s.description || '',
+        icon_url: s.icon_url || null,
+        duration: s.duration,
+        price: s.price,
+        offer_price: s.offer_price,
+        offer_enabled: s.offer_enabled,
+        category_id: s.category_id
+      };
+    });
+
+    return res.json({
+      userId,
+      currentServiceId,
+      recommendations,
+      usedMlService: true
+    });
+  } catch (error) {
+    console.error('Get service recommendations error:', error);
+    return res.status(500).json({ error: 'Failed to get service recommendations' });
   }
 });
 

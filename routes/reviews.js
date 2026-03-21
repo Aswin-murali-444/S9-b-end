@@ -2,6 +2,172 @@ const express = require('express');
 const router = express.Router();
 const { supabase } = require('../lib/supabase');
 
+// Create or update a service review from a customer
+router.post('/service', async (req, res) => {
+  try {
+    const { serviceId, bookingId, rating, note, answers, authUserId } = req.body || {};
+
+    if (!serviceId || !authUserId || typeof rating !== 'number') {
+      return res.status(400).json({ error: 'serviceId, authUserId and numeric rating are required' });
+    }
+
+    if (rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+    }
+
+    // Map Supabase auth user ID to internal users.id
+    const { data: userRow, error: userError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('auth_user_id', authUserId)
+      .single();
+
+    if (userError || !userRow) {
+      console.error('Error resolving internal user ID for review:', userError);
+      return res.status(400).json({ error: 'Unable to resolve user for review' });
+    }
+
+    const customerId = userRow.id;
+
+    // Upsert review so a customer can update their review for a service
+    const { data: reviewRow, error: reviewError } = await supabase
+      .from('service_reviews')
+      .upsert(
+        {
+          service_id: serviceId,
+          booking_id: bookingId || null,
+          customer_id: customerId,
+          rating,
+          note: note || null,
+          answers: answers && Object.keys(answers || {}).length > 0 ? answers : null
+        },
+        {
+          onConflict: 'service_id,customer_id'
+        }
+      )
+      .select('*')
+      .single();
+
+    if (reviewError) {
+      console.error('Error saving service review:', reviewError);
+      return res.status(500).json({ error: 'Failed to save review' });
+    }
+
+    // Optionally mirror rating/feedback onto the booking record if provided
+    if (bookingId) {
+      await supabase
+        .from('bookings')
+        .update({
+          customer_rating: rating,
+          customer_feedback: note || null,
+          feedback_submitted_at: new Date().toISOString()
+        })
+        .eq('id', bookingId);
+    }
+
+    // Recalculate aggregate rating for the service
+    const { data: allReviews, count, error: aggError } = await supabase
+      .from('service_reviews')
+      .select('rating', { count: 'exact' })
+      .eq('service_id', serviceId);
+
+    if (!aggError && Array.isArray(allReviews) && (count || 0) > 0) {
+      const total = allReviews.reduce((sum, r) => sum + (r.rating || 0), 0);
+      const average = total / count;
+
+      await supabase
+        .from('services')
+        .update({
+          rating: Math.round(average * 10) / 10,
+          review_count: count
+        })
+        .eq('id', serviceId);
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        review: reviewRow
+      }
+    });
+  } catch (error) {
+    console.error('Create service review error:', error);
+    res.status(500).json({ error: error.message || 'Failed to submit review' });
+  }
+});
+
+// Get reviews for a specific service (visible to all customers)
+router.get('/service/:serviceId', async (req, res) => {
+  try {
+    const { serviceId } = req.params;
+    const { page = 1, limit = 20 } = req.query;
+    const pageNum = parseInt(page, 10) || 1;
+    const pageSize = parseInt(limit, 10) || 20;
+    const from = (pageNum - 1) * pageSize;
+    const to = from + pageSize - 1;
+
+    if (!serviceId) {
+      return res.status(400).json({ error: 'Service ID is required' });
+    }
+
+    const { data: rows, count, error } = await supabase
+      .from('service_reviews')
+      .select(`
+        id,
+        rating,
+        note,
+        created_at,
+        customer_id,
+        users:customer_id (
+          user_profiles (
+            first_name,
+            last_name
+          )
+        )
+      `, { count: 'exact' })
+      .eq('service_id', serviceId)
+      .order('created_at', { ascending: false })
+      .range(from, to);
+
+    if (error) {
+      console.error('Error fetching service reviews:', error);
+      return res.status(500).json({ error: 'Failed to fetch reviews' });
+    }
+
+    const reviews = (rows || []).map(row => {
+      const profileSource = row.users?.user_profiles;
+      const userProfile = Array.isArray(profileSource) ? profileSource[0] : profileSource;
+      const firstName = userProfile?.first_name || '';
+      const lastName = userProfile?.last_name || '';
+      const customerName = `${firstName} ${lastName}`.trim() || 'Anonymous';
+
+      return {
+        id: row.id,
+        rating: row.rating,
+        note: row.note,
+        created_at: row.created_at,
+        customer_name: customerName
+      };
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        reviews,
+        pagination: {
+          page: pageNum,
+          limit: pageSize,
+          total: count || 0,
+          pages: Math.ceil((count || 0) / pageSize)
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Get service reviews error:', error);
+    res.status(500).json({ error: error.message || 'Failed to get service reviews' });
+  }
+});
+
 // Get reviews for a specific provider
 router.get('/provider/:providerId', async (req, res) => {
   try {

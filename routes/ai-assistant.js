@@ -4,12 +4,21 @@ const router = express.Router();
 
 class AIAssistantService {
   constructor() {
-    this.apiKey = process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY;
-    this.model = process.env.AI_MODEL || 'openai/gpt-4o-mini';
+    // Groq, OpenAI, and OpenRouter all support OpenAI-compatible chat completions.
+    // We choose the base URL by provider, and the key from the best available env var.
     this.provider = process.env.AI_PROVIDER || 'openrouter';
-    this.baseUrl = this.provider === 'openrouter' 
-      ? 'https://openrouter.ai/api/v1' 
-      : 'https://api.openai.com/v1';
+    this.apiKey = process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY;
+
+    const providerDefaultModel = this.provider === 'groq'
+      ? 'meta-llama/llama-4-scout-17b-16e-instruct'
+      : 'openai/gpt-4o-mini';
+    this.model = process.env.AI_MODEL || providerDefaultModel;
+
+    this.baseUrl = this.provider === 'openrouter'
+      ? 'https://openrouter.ai/api/v1'
+      : this.provider === 'groq'
+        ? 'https://api.groq.com/openai/v1'
+        : 'https://api.openai.com/v1';
   }
 
   async generateResponse(userMessage, conversationHistory = [], imageData = null) {
