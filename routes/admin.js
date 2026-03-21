@@ -825,6 +825,248 @@ router.get('/activity-feed', async (req, res) => {
   }
 });
 
+// Get real security events for admin dashboard (DB-backed, no simulated rows)
+router.get('/security-events', async (req, res) => {
+  try {
+    const { limit = 30 } = req.query;
+    const cap = Math.min(Math.max(parseInt(limit, 10) || 30, 1), 100);
+    const events = [];
+
+    // 1) Provider profile status changes audit trail (if table exists)
+    try {
+      const { data: statusLogRows, error: statusLogError } = await supabase
+        .from('profile_status_log')
+        .select('id, provider_id, old_status, new_status, reason, created_at')
+        .order('created_at', { ascending: false })
+        .limit(cap);
+
+      if (!statusLogError && Array.isArray(statusLogRows) && statusLogRows.length > 0) {
+        const providerIds = [...new Set(statusLogRows.map((r) => r.provider_id).filter(Boolean))];
+        let emailByProviderId = {};
+
+        if (providerIds.length > 0) {
+          const { data: providerRows } = await supabase
+            .from('provider_profiles')
+            .select(`
+              provider_id,
+              users!provider_profiles_provider_id_fkey(email)
+            `)
+            .in('provider_id', providerIds);
+
+          emailByProviderId = (providerRows || []).reduce((acc, row) => {
+            acc[row.provider_id] = row?.users?.email || null;
+            return acc;
+          }, {});
+        }
+
+        statusLogRows.forEach((row) => {
+          const severity =
+            row?.new_status === 'suspended' || row?.new_status === 'rejected'
+              ? 'high'
+              : row?.new_status === 'pending_verification'
+                ? 'medium'
+                : 'low';
+
+          events.push({
+            id: `status-log-${row.id}`,
+            type: 'permission_change',
+            user: emailByProviderId[row.provider_id] || 'Unknown user',
+            ip: null,
+            target: row?.reason || `${row.old_status || 'unknown'} -> ${row.new_status || 'unknown'}`,
+            resource: null,
+            timestamp: row?.created_at || null,
+            severity,
+            status: row?.new_status === 'suspended' ? 'blocked' : 'investigating'
+          });
+        });
+      }
+    } catch (statusLogQueryError) {
+      console.warn('Skipping profile_status_log security events:', statusLogQueryError?.message || statusLogQueryError);
+    }
+
+    // 2) Security/verification notifications from DB
+    const { data: securityNotifications, error: notificationsError } = await supabase
+      .from('notifications')
+      .select('id, type, title, message, metadata, priority, status, created_at')
+      .in('type', ['verification_status_changed', 'provider_pending_verification'])
+      .order('created_at', { ascending: false })
+      .limit(cap);
+
+    if (!notificationsError && Array.isArray(securityNotifications)) {
+      securityNotifications.forEach((n) => {
+        const metadata = n?.metadata || {};
+        const inferredType =
+          n?.type === 'provider_pending_verification'
+            ? 'suspicious_activity'
+            : 'data_access';
+
+        events.push({
+          id: `notif-${n.id}`,
+          type: inferredType,
+          user: metadata?.user_email || metadata?.provider_email || 'System',
+          ip: metadata?.ip_address || null,
+          target: n?.title || n?.message || 'N/A',
+          resource: metadata?.new_status || metadata?.status || null,
+          timestamp: n?.created_at || null,
+          severity: (n?.priority || 'medium').toLowerCase(),
+          status: (n?.status || 'investigating').toLowerCase()
+        });
+      });
+    }
+
+    // 3) Live auth events from Supabase Auth (registration, login, Google continue/sign-in)
+    let authEventsAdded = 0;
+    try {
+      const perPage = Math.min(Math.max(cap * 3, 30), 200);
+      const { data: authList, error: authUsersError } = await supabase.auth.admin.listUsers({
+        page: 1,
+        perPage
+      });
+
+      if (!authUsersError && Array.isArray(authList?.users)) {
+        const authUsers = authList.users;
+
+        const hasGoogleIdentity = (authUser) => {
+          const appProvider = String(authUser?.app_metadata?.provider || '').toLowerCase();
+          if (appProvider === 'google') return true;
+          const identities = Array.isArray(authUser?.identities) ? authUser.identities : [];
+          return identities.some((identity) => String(identity?.provider || '').toLowerCase() === 'google');
+        };
+
+        authUsers.forEach((authUser) => {
+          const email = authUser?.email || 'Unknown user';
+          const createdAt = authUser?.created_at || null;
+          const lastSignInAt = authUser?.last_sign_in_at || null;
+          const provider = hasGoogleIdentity(authUser) ? 'google' : 'email';
+
+          if (createdAt) {
+            events.push({
+              id: `auth-register-${authUser.id}-${createdAt}`,
+              type: 'user_registered',
+              user: email,
+              ip: null,
+              target: provider === 'google' ? 'New user registered (Google)' : 'New user registered',
+              resource: provider,
+              timestamp: createdAt,
+              severity: 'low',
+              status: 'normal'
+            });
+            authEventsAdded += 1;
+          }
+
+          if (lastSignInAt) {
+            events.push({
+              id: `auth-login-${authUser.id}-${lastSignInAt}`,
+              type: 'user_login',
+              user: email,
+              ip: null,
+              target: provider === 'google' ? 'Successful login (Google)' : 'Successful login',
+              resource: provider,
+              timestamp: lastSignInAt,
+              severity: 'info',
+              status: 'normal'
+            });
+            authEventsAdded += 1;
+
+            if (provider === 'google') {
+              events.push({
+                id: `auth-google-${authUser.id}-${lastSignInAt}`,
+                type: 'google_continue',
+                user: email,
+                ip: null,
+                target: 'Continue with Google used',
+                resource: 'google',
+                timestamp: lastSignInAt,
+                severity: 'info',
+                status: 'normal'
+              });
+              authEventsAdded += 1;
+            }
+          }
+        });
+      }
+    } catch (authEventsError) {
+      console.warn('Skipping Supabase Auth-based security events:', authEventsError?.message || authEventsError);
+    }
+
+    // 3b) Fallback to app users table when auth admin events are unavailable.
+    // This ensures the Recent Security Events table is never empty for active systems.
+    if (authEventsAdded === 0) {
+      const { data: appUsers, error: appUsersError } = await supabase
+        .from('users')
+        .select('id, email, created_at, last_login_at')
+        .order('created_at', { ascending: false })
+        .limit(cap);
+
+      if (!appUsersError && Array.isArray(appUsers)) {
+        appUsers.forEach((u) => {
+          if (u?.created_at) {
+            events.push({
+              id: `fallback-register-${u.id}-${u.created_at}`,
+              type: 'user_registered',
+              user: u?.email || 'Unknown user',
+              ip: null,
+              target: 'New user registered',
+              resource: 'email',
+              timestamp: u.created_at,
+              severity: 'low',
+              status: 'normal'
+            });
+          }
+
+          if (u?.last_login_at) {
+            events.push({
+              id: `fallback-login-${u.id}-${u.last_login_at}`,
+              type: 'user_login',
+              user: u?.email || 'Unknown user',
+              ip: null,
+              target: 'Successful login',
+              resource: 'email',
+              timestamp: u.last_login_at,
+              severity: 'info',
+              status: 'normal'
+            });
+          }
+        });
+      }
+    }
+
+    // Sort by timestamp desc and return limited rows
+    const sorted = events
+      .filter((e) => e?.timestamp)
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+      .slice(0, cap);
+
+    const allWithTimestamp = events.filter((e) => e?.timestamp);
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    const unresolvedStatuses = new Set(['investigating', 'blocked', 'pending', 'unread', 'warning', 'error']);
+    const highSeverities = new Set(['high', 'critical']);
+
+    const failedLoginEvents = allWithTimestamp.filter((e) => e.type === 'failed_login');
+    const failedLoginsToday = failedLoginEvents.filter((e) => new Date(e.timestamp) >= dayStart).length;
+    const activeThreats = allWithTimestamp.filter(
+      (e) => highSeverities.has(String(e.severity || '').toLowerCase()) &&
+        unresolvedStatuses.has(String(e.status || '').toLowerCase())
+    ).length;
+
+    return res.json({
+      success: true,
+      data: sorted,
+      summary: {
+        failedLogins: failedLoginEvents.length,
+        failedLoginsToday,
+        securityThreats: activeThreats
+      }
+    });
+  } catch (error) {
+    console.error('Admin security-events error:', error);
+    return res.status(500).json({
+      error: error.message || 'Failed to fetch security events'
+    });
+  }
+});
+
 // GET /admin/bookings – list all bookings with customer, service, who accepted, when
 async function getAdminBookings(req, res) {
   try {
@@ -1034,6 +1276,333 @@ router.get('/rating-summary', async (req, res) => {
   } catch (err) {
     console.error('Admin rating-summary error:', err);
     res.status(500).json({ error: err.message || 'Failed to fetch rating summary' });
+  }
+});
+
+// GET /admin/analytics-summary – DB-backed analytics for admin analytics tab
+router.get('/analytics-summary', async (req, res) => {
+  try {
+    const daysRaw = parseInt(req.query.days, 10);
+    const days = Number.isFinite(daysRaw) ? Math.min(Math.max(daysRaw, 7), 365) : 30;
+
+    const now = new Date();
+    const currentStart = new Date(now);
+    currentStart.setDate(currentStart.getDate() - days);
+    const previousStart = new Date(currentStart);
+    previousStart.setDate(previousStart.getDate() - days);
+
+    const toIso = (d) => d.toISOString();
+    const pctChange = (current, previous) => {
+      const c = Number(current) || 0;
+      const p = Number(previous) || 0;
+      if (p === 0) return c === 0 ? 0 : 100;
+      return ((c - p) / p) * 100;
+    };
+
+    // Pull users and bookings for current+previous windows
+    const [{ data: usersRows }, { data: bookingRows }, { data: reviewRows }, { data: statusLogRows }, { data: notifRows }] =
+      await Promise.all([
+        supabase
+          .from('users')
+          .select('created_at')
+          .gte('created_at', toIso(previousStart))
+          .lte('created_at', toIso(now)),
+        supabase
+          .from('bookings')
+          .select('created_at, total_amount, payment_status, booking_status, customer_rating')
+          .gte('created_at', toIso(previousStart))
+          .lte('created_at', toIso(now)),
+        supabase
+          .from('service_reviews')
+          .select('created_at, rating')
+          .gte('created_at', toIso(previousStart))
+          .lte('created_at', toIso(now)),
+        supabase
+          .from('profile_status_log')
+          .select('created_at, new_status')
+          .gte('created_at', toIso(previousStart))
+          .lte('created_at', toIso(now)),
+        supabase
+          .from('notifications')
+          .select('created_at, priority, type')
+          .in('type', ['verification_status_changed', 'provider_pending_verification'])
+          .gte('created_at', toIso(previousStart))
+          .lte('created_at', toIso(now))
+      ]);
+
+    const users = Array.isArray(usersRows) ? usersRows : [];
+    const bookings = Array.isArray(bookingRows) ? bookingRows : [];
+    const reviews = Array.isArray(reviewRows) ? reviewRows : [];
+    const statusLogs = Array.isArray(statusLogRows) ? statusLogRows : [];
+    const notifications = Array.isArray(notifRows) ? notifRows : [];
+
+    const inCurrent = (iso) => {
+      const t = new Date(iso).getTime();
+      return t >= currentStart.getTime() && t <= now.getTime();
+    };
+    const inPrevious = (iso) => {
+      const t = new Date(iso).getTime();
+      return t >= previousStart.getTime() && t < currentStart.getTime();
+    };
+
+    const userCurrent = users.filter((u) => u.created_at && inCurrent(u.created_at)).length;
+    const userPrevious = users.filter((u) => u.created_at && inPrevious(u.created_at)).length;
+
+    const bookingCurrent = bookings.filter((b) => b.created_at && inCurrent(b.created_at));
+    const bookingPrevious = bookings.filter((b) => b.created_at && inPrevious(b.created_at));
+
+    const revenueFrom = (rows) =>
+      rows.reduce((sum, b) => {
+        const paid = ['completed', 'paid'].includes(String(b.payment_status || '').toLowerCase());
+        return sum + (paid ? Number(b.total_amount || 0) : 0);
+      }, 0);
+
+    const revenueCurrent = revenueFrom(bookingCurrent);
+    const revenuePrevious = revenueFrom(bookingPrevious);
+
+    const requestsCurrent = bookingCurrent.length;
+    const requestsPrevious = bookingPrevious.length;
+
+    const reviewCurrentRows = reviews.filter((r) => r.created_at && inCurrent(r.created_at) && Number(r.rating) > 0);
+    const reviewPreviousRows = reviews.filter((r) => r.created_at && inPrevious(r.created_at) && Number(r.rating) > 0);
+
+    const avg = (rows) => {
+      if (!rows.length) return 0;
+      const sum = rows.reduce((s, r) => s + Number(r.rating || 0), 0);
+      return sum / rows.length;
+    };
+
+    // Fallback to booking customer_rating when service_reviews unavailable
+    let satCurrent = avg(reviewCurrentRows);
+    let satPrevious = avg(reviewPreviousRows);
+    if (satCurrent === 0) {
+      const bookingRatedCurrent = bookingCurrent.filter((b) => Number(b.customer_rating) > 0);
+      satCurrent = bookingRatedCurrent.length
+        ? bookingRatedCurrent.reduce((s, b) => s + Number(b.customer_rating || 0), 0) / bookingRatedCurrent.length
+        : 0;
+    }
+    if (satPrevious === 0) {
+      const bookingRatedPrevious = bookingPrevious.filter((b) => Number(b.customer_rating) > 0);
+      satPrevious = bookingRatedPrevious.length
+        ? bookingRatedPrevious.reduce((s, b) => s + Number(b.customer_rating || 0), 0) / bookingRatedPrevious.length
+        : 0;
+    }
+
+    // Last 12-day trend windows from DB rows
+    const daysForTrend = 12;
+    const dayBucketKey = (date) => {
+      const d = new Date(date);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+    const lastDays = [];
+    for (let i = daysForTrend - 1; i >= 0; i -= 1) {
+      const d = new Date(now);
+      d.setHours(0, 0, 0, 0);
+      d.setDate(d.getDate() - i);
+      lastDays.push(dayBucketKey(d));
+    }
+
+    const bookingByDay = {};
+    bookings.forEach((b) => {
+      if (!b.created_at) return;
+      const key = dayBucketKey(b.created_at);
+      if (!lastDays.includes(key)) return;
+      if (!bookingByDay[key]) bookingByDay[key] = { total: 0, completed: 0 };
+      bookingByDay[key].total += 1;
+      if (String(b.booking_status || '').toLowerCase() === 'completed') {
+        bookingByDay[key].completed += 1;
+      }
+    });
+
+    const systemPerformanceTrend = lastDays.map((key) => {
+      const day = bookingByDay[key] || { total: 0, completed: 0 };
+      if (day.total === 0) return 0;
+      return Math.round((day.completed / day.total) * 100);
+    });
+
+    const securityByDay = {};
+    const addSecurityRow = (createdAt, severityScore) => {
+      if (!createdAt) return;
+      const key = dayBucketKey(createdAt);
+      if (!lastDays.includes(key)) return;
+      securityByDay[key] = (securityByDay[key] || 0) + severityScore;
+    };
+
+    statusLogs.forEach((row) => {
+      const sev = ['suspended', 'rejected'].includes(String(row.new_status || '').toLowerCase()) ? 3 : 1;
+      addSecurityRow(row.created_at, sev);
+    });
+    notifications.forEach((n) => {
+      const pri = String(n.priority || '').toLowerCase();
+      const sev = pri === 'high' ? 3 : pri === 'medium' ? 2 : 1;
+      addSecurityRow(n.created_at, sev);
+    });
+
+    const securityScoreTrend = lastDays.map((key) => {
+      const penalty = securityByDay[key] || 0;
+      return Math.max(0, Math.min(100, 100 - penalty * 5));
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        userGrowth: {
+          current: userCurrent,
+          previous: userPrevious,
+          change: pctChange(userCurrent, userPrevious)
+        },
+        revenueGrowth: {
+          current: revenueCurrent,
+          previous: revenuePrevious,
+          change: pctChange(revenueCurrent, revenuePrevious)
+        },
+        serviceRequests: {
+          current: requestsCurrent,
+          previous: requestsPrevious,
+          change: pctChange(requestsCurrent, requestsPrevious)
+        },
+        customerSatisfaction: {
+          current: Number(satCurrent.toFixed(1)),
+          previous: Number(satPrevious.toFixed(1)),
+          change: pctChange(satCurrent, satPrevious)
+        },
+        trends: {
+          systemPerformance: systemPerformanceTrend,
+          securityScore: securityScoreTrend
+        }
+      }
+    });
+  } catch (err) {
+    console.error('Admin analytics-summary error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to fetch analytics summary' });
+  }
+});
+
+// GET /admin/payment-insights – customer paid vs worker paid vs company profit
+router.get('/payment-insights', async (req, res) => {
+  try {
+    const daysRaw = parseInt(req.query.days, 10);
+    const days = Number.isFinite(daysRaw) ? Math.min(Math.max(daysRaw, 7), 365) : 30;
+    const now = new Date();
+    const start = new Date(now);
+    start.setDate(start.getDate() - days);
+
+    const { data: bookingRows, error: bookingErr } = await supabase
+      .from('bookings')
+      .select(`
+        id,
+        created_at,
+        total_amount,
+        payment_status,
+        services(name)
+      `)
+      .limit(5000);
+
+    if (bookingErr) {
+      return res.status(500).json({ error: bookingErr.message || 'Failed to fetch payment insights bookings' });
+    }
+
+    const bookingsAll = Array.isArray(bookingRows) ? bookingRows : [];
+    const bookingsInRange = bookingsAll.filter((b) => {
+      if (!b?.created_at) return true;
+      const t = new Date(b.created_at).getTime();
+      return t >= start.getTime() && t <= now.getTime();
+    });
+    // Fallback to all-time if selected window has no rows
+    const bookings = bookingsInRange.length > 0 ? bookingsInRange : bookingsAll;
+    const bookingById = new Map(bookings.map((b) => [String(b.id), b]));
+
+    const isCustomerPaid = (status) => {
+      const s = String(status || '').toLowerCase();
+      return ['paid', 'completed', 'processing', 'success'].includes(s);
+    };
+    const customerPaidRows = bookings.filter((b) => isCustomerPaid(b.payment_status));
+
+    let payoutRows = [];
+    try {
+      const { data: pRows, error: pErr } = await supabase
+        .from('booking_worker_payouts')
+        .select('booking_id, worker_payout_amount, payout_status, paid_at')
+        .limit(5000);
+      if (!pErr && Array.isArray(pRows)) payoutRows = pRows;
+    } catch (_) {
+      payoutRows = [];
+    }
+    const payoutsInRange = payoutRows.filter((p) => {
+      if (!p?.paid_at) return true;
+      const t = new Date(p.paid_at).getTime();
+      return t >= start.getTime() && t <= now.getTime();
+    });
+    const payouts = payoutsInRange.length > 0 ? payoutsInRange : payoutRows;
+
+    const isWorkerPaid = (status) => {
+      const s = String(status || '').toLowerCase();
+      return ['paid', 'completed', 'success', 'earned'].includes(s);
+    };
+
+    const byService = new Map();
+    let totalCustomerPaid = 0;
+    let totalWorkerPaid = 0;
+    let totalPendingWorkerPayout = 0;
+
+    const getBucket = (serviceName) => {
+      const key = serviceName || 'Unknown Service';
+      if (!byService.has(key)) {
+        byService.set(key, {
+          serviceName: key,
+          jobsCount: 0,
+          customerPaid: 0,
+          workerPaid: 0
+        });
+      }
+      return byService.get(key);
+    };
+
+    customerPaidRows.forEach((b) => {
+      const serviceName = b?.services?.name || 'Unknown Service';
+      const amt = Number(b.total_amount || 0);
+      const bucket = getBucket(serviceName);
+      bucket.jobsCount += 1;
+      bucket.customerPaid += amt;
+      totalCustomerPaid += amt;
+    });
+
+    payouts.forEach((p) => {
+      const b = bookingById.get(String(p.booking_id));
+      const serviceName = b?.services?.name || 'Unknown Service';
+      const amt = Number(p.worker_payout_amount || 0);
+      const bucket = getBucket(serviceName);
+      if (isWorkerPaid(p.payout_status)) {
+        bucket.workerPaid += amt;
+        totalWorkerPaid += amt;
+      } else {
+        totalPendingWorkerPayout += amt;
+      }
+    });
+
+    const rows = Array.from(byService.values())
+      .map((r) => {
+        const companyProfit = r.customerPaid - r.workerPaid;
+        const marginPct = r.customerPaid > 0 ? (companyProfit / r.customerPaid) * 100 : 0;
+        return { ...r, companyProfit, marginPct };
+      })
+      .sort((a, b) => b.customerPaid - a.customerPaid);
+
+    return res.json({
+      success: true,
+      data: {
+        totals: {
+          customerPaid: totalCustomerPaid,
+          workerPaid: totalWorkerPaid,
+          pendingWorkerPayout: totalPendingWorkerPayout,
+          companyProfit: totalCustomerPaid - totalWorkerPaid
+        },
+        byService: rows
+      }
+    });
+  } catch (err) {
+    console.error('Admin payment-insights error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to fetch payment insights' });
   }
 });
 
