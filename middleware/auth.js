@@ -4,6 +4,52 @@ const { supabase } = require('../lib/supabase');
 // Initialize User Service
 const userService = new UserService();
 
+const getRequestIp = (req) => {
+  const forwarded = String(req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
+  return forwarded || req?.ip || req?.socket?.remoteAddress || null;
+};
+
+const recordFailedLoginAttempt = async ({ email, req, reason = 'Invalid credentials' }) => {
+  try {
+    const normalizedEmail = String(email || '').toLowerCase().trim();
+    const ipAddress = getRequestIp(req);
+    const userAgent = String(req?.headers?.['user-agent'] || '');
+
+    const { data: admins, error: adminError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('role', 'admin')
+      .eq('status', 'active');
+
+    if (adminError || !Array.isArray(admins) || admins.length === 0) {
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const rows = admins.map((admin) => ({
+      type: 'failed_login',
+      title: 'Failed login attempt detected',
+      message: `Failed login attempt for ${normalizedEmail || 'unknown email'}`,
+      recipient_id: admin.id,
+      sender_id: null,
+      status: 'unread',
+      priority: 'high',
+      metadata: {
+        user_email: normalizedEmail || null,
+        ip_address: ipAddress,
+        reason,
+        user_agent: userAgent || null
+      },
+      created_at: nowIso
+    }));
+
+    await supabase.from('notifications').insert(rows);
+  } catch (error) {
+    // Failed-login recording should never block the login response path
+    console.warn('Failed to record failed login attempt:', error?.message || error);
+  }
+};
+
 // User Registration Endpoint with Role
 const registerUser = async (req, res) => {
   try {
@@ -64,9 +110,11 @@ const loginUser = async (req, res) => {
       user = await userService.getUserByEmail(email);
     } catch (e) {
       // Treat missing user or lookup errors as invalid credentials
+      await recordFailedLoginAttempt({ email, req, reason: 'User lookup failed or user not found' });
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     if (!user) {
+      await recordFailedLoginAttempt({ email, req, reason: 'User not found' });
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
@@ -75,6 +123,7 @@ const loginUser = async (req, res) => {
     // Strict match on base64 to ensure only the latest updated password works
     const stored = String(user.password_hash || '');
     if (stored !== password_hash) {
+      await recordFailedLoginAttempt({ email, req, reason: 'Password mismatch' });
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 

@@ -888,7 +888,7 @@ router.get('/security-events', async (req, res) => {
     const { data: securityNotifications, error: notificationsError } = await supabase
       .from('notifications')
       .select('id, type, title, message, metadata, priority, status, created_at')
-      .in('type', ['verification_status_changed', 'provider_pending_verification'])
+      .in('type', ['verification_status_changed', 'provider_pending_verification', 'failed_login'])
       .order('created_at', { ascending: false })
       .limit(cap);
 
@@ -896,7 +896,9 @@ router.get('/security-events', async (req, res) => {
       securityNotifications.forEach((n) => {
         const metadata = n?.metadata || {};
         const inferredType =
-          n?.type === 'provider_pending_verification'
+          n?.type === 'failed_login'
+            ? 'failed_login'
+            : n?.type === 'provider_pending_verification'
             ? 'suspicious_activity'
             : 'data_access';
 
