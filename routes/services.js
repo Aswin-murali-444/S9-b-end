@@ -26,6 +26,14 @@ function buildServiceTrendsFromRows(rows) {
   return trends;
 }
 
+/** Only pad / surface services with real demand: booked in sample or activity in trend windows */
+function hasRecommendationEvidence(serviceId, bookingCount, trends) {
+  const c = Number(bookingCount) || 0;
+  if (c >= 1) return true;
+  const t = trends[String(serviceId)] || { recent: 0, prior: 0 };
+  return Number(t.recent || 0) + Number(t.prior || 0) >= 1;
+}
+
 function fallbackInsight(serviceId, trends, popCount, maxPop) {
   const t = trends[String(serviceId)] || { recent: 0, prior: 0 };
   const mom = (t.recent + 0.5) / (t.prior + 0.5);
@@ -71,8 +79,10 @@ async function backfillRecommendationsEnriched(
     if (idQueue.length >= want) break;
     const sid = String(p.service_id);
     if (!sid || excludeSet.has(sid) || have.has(sid)) continue;
+    const cnt = Number(p.count) || 0;
+    if (!hasRecommendationEvidence(sid, cnt, serviceTrends)) continue;
     have.add(sid);
-    idQueue.push({ sid, count: Number(p.count) || 0 });
+    idQueue.push({ sid, count: cnt });
   }
   if (!idQueue.length) return recommendations;
 
@@ -280,21 +290,6 @@ router.get('/user/:userId/recommendations', async (req, res) => {
       popularityCounts[String(b.service_id)] = (popularityCounts[String(b.service_id)] || 0) + 1;
     }
 
-    // Every catalog service must be a candidate for ML (not only IDs seen in the 1000-row sample).
-    // Otherwise users with many preferred_services see almost nothing to recommend.
-    try {
-      const { data: catalogIds, error: catErr } = await supabase.from('services').select('id').limit(1000);
-      if (!catErr && Array.isArray(catalogIds)) {
-        for (const row of catalogIds) {
-          if (row?.id == null) continue;
-          const k = String(row.id);
-          if (popularityCounts[k] === undefined) popularityCounts[k] = 0;
-        }
-      }
-    } catch (e) {
-      console.warn('Recommendation catalog merge skipped:', e?.message || e);
-    }
-
     // Build co-occurrence matrix at user level (services that co-occur for same user)
     Object.values(bookingsByUser).forEach((serviceList) => {
       const uniqueServices = Array.from(new Set(serviceList));
@@ -309,9 +304,37 @@ router.get('/user/:userId/recommendations', async (req, res) => {
       }
     });
 
+    // ML popularity list: only services with at least one booking in sample (no never-booked filler)
     const popularServices = Object.entries(popularityCounts)
+      .filter(([, c]) => Number(c) >= 1)
       .sort(([, aCount], [, bCount]) => bCount - aCount)
       .map(([serviceId, count]) => ({ service_id: serviceId, count }));
+
+    // Category map for ML: rank same-category services higher when co-occurrence is weak
+    let serviceCategoryById = {};
+    try {
+      const { data: catRows, error: catErr } = await supabase
+        .from('services')
+        .select('id, category_id')
+        .limit(1000);
+      if (!catErr && Array.isArray(catRows)) {
+        for (const row of catRows) {
+          if (row?.id == null) continue;
+          serviceCategoryById[String(row.id)] =
+            row.category_id != null ? String(row.category_id) : '';
+        }
+      }
+    } catch (e) {
+      console.warn('Recommendation category map skipped:', e?.message || e);
+    }
+
+    const userAffinityCategoryIds = [
+      ...new Set(
+        userHistory
+          .map((hid) => serviceCategoryById[String(hid)])
+          .filter((x) => x != null && x !== '')
+      )
+    ];
 
     // Trend windows: last 14 days of bookings (for ML momentum: recent 7d vs prior 7d)
     let serviceTrends = {};
@@ -344,6 +367,8 @@ router.get('/user/:userId/recommendations', async (req, res) => {
       global_cooccurrence: globalCooccurrence,
       popular_services: popularServices,
       service_trends: serviceTrends,
+      service_category_ids: serviceCategoryById,
+      user_affinity_category_ids: userAffinityCategoryIds,
       limit: Number.isFinite(limit) && limit > 0 ? limit : 5
     };
 
