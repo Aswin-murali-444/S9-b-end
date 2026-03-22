@@ -3,6 +3,115 @@ const router = express.Router();
 const { supabase } = require('../lib/supabase');
 const { recommendServicesForUser } = require('../services/mlService');
 
+/**
+ * Booking momentum per service: last 7 days vs previous 7 days (platform trend signal).
+ */
+function buildServiceTrendsFromRows(rows) {
+  const trends = {};
+  if (!Array.isArray(rows)) return trends;
+  const now = Date.now();
+  const DAY = 24 * 60 * 60 * 1000;
+  const recentStart = now - 7 * DAY;
+  const priorStart = now - 14 * DAY;
+
+  for (const b of rows) {
+    if (!b?.service_id || !b?.created_at) continue;
+    const sid = String(b.service_id);
+    const ts = new Date(b.created_at).getTime();
+    if (Number.isNaN(ts)) continue;
+    if (!trends[sid]) trends[sid] = { recent: 0, prior: 0 };
+    if (ts >= recentStart) trends[sid].recent += 1;
+    else if (ts >= priorStart && ts < recentStart) trends[sid].prior += 1;
+  }
+  return trends;
+}
+
+function fallbackInsight(serviceId, trends, popCount, maxPop) {
+  const t = trends[String(serviceId)] || { recent: 0, prior: 0 };
+  const mom = (t.recent + 0.5) / (t.prior + 0.5);
+  const popNorm = maxPop > 0 ? popCount / maxPop : 0;
+  if (t.recent >= 2 && mom >= 1.4) {
+    return { insightKey: 'trending', insightLabel: 'Trending this week' };
+  }
+  if (t.recent >= 3) {
+    return { insightKey: 'high_demand', insightLabel: 'High demand lately' };
+  }
+  if (mom >= 1.25 && t.recent >= 1) {
+    return { insightKey: 'rising', insightLabel: 'Rising interest' };
+  }
+  if (popNorm >= 0.65) {
+    return { insightKey: 'popular', insightLabel: 'Popular with customers' };
+  }
+  return { insightKey: 'popular', insightLabel: 'Popular right now' };
+}
+
+/**
+ * When ML returns fewer than `targetCount` (e.g. small booking sample + many prefs excluded),
+ * pad with next-best popular/catalog services so the dashboard always shows a full row.
+ */
+async function backfillRecommendationsEnriched(
+  supabase,
+  recommendations,
+  targetCount,
+  popularServices,
+  excludeSet,
+  serviceTrends,
+  maxPop
+) {
+  const cap = Math.max(1, Number(targetCount) || 5);
+  if (!Array.isArray(recommendations) || recommendations.length >= cap) return recommendations;
+
+  const have = new Set(recommendations.map((r) => String(r.serviceId)));
+  const sorted = [...(popularServices || [])].sort(
+    (a, b) => (Number(b.count) || 0) - (Number(a.count) || 0)
+  );
+  const want = cap - recommendations.length;
+  const idQueue = [];
+  for (const p of sorted) {
+    if (idQueue.length >= want) break;
+    const sid = String(p.service_id);
+    if (!sid || excludeSet.has(sid) || have.has(sid)) continue;
+    have.add(sid);
+    idQueue.push({ sid, count: Number(p.count) || 0 });
+  }
+  if (!idQueue.length) return recommendations;
+
+  const { data: serviceRows } = await supabase
+    .from('services')
+    .select('id, name, description, icon_url, duration, price, offer_price, offer_enabled, category_id')
+    .in(
+      'id',
+      idQueue.map((x) => x.sid)
+    );
+
+  const serviceById = {};
+  (serviceRows || []).forEach((s) => {
+    serviceById[String(s.id)] = s;
+  });
+
+  const extra = idQueue.map(({ sid, count }) => {
+    const s = serviceById[sid] || {};
+    const ins = fallbackInsight(sid, serviceTrends, count, maxPop);
+    return {
+      serviceId: sid,
+      score: count > 0 ? count * 0.001 : 0.01,
+      insightKey: ins.insightKey,
+      insightLabel: ins.insightLabel,
+      scoreComponents: null,
+      name: s.name || '',
+      description: s.description || '',
+      icon_url: s.icon_url || null,
+      duration: s.duration,
+      price: s.price,
+      offer_price: s.offer_price,
+      offer_enabled: s.offer_enabled,
+      category_id: s.category_id
+    };
+  });
+
+  return [...recommendations, ...extra];
+}
+
 // List services with category information
 router.get('/', async (req, res) => {
   try {
@@ -171,6 +280,21 @@ router.get('/user/:userId/recommendations', async (req, res) => {
       popularityCounts[String(b.service_id)] = (popularityCounts[String(b.service_id)] || 0) + 1;
     }
 
+    // Every catalog service must be a candidate for ML (not only IDs seen in the 1000-row sample).
+    // Otherwise users with many preferred_services see almost nothing to recommend.
+    try {
+      const { data: catalogIds, error: catErr } = await supabase.from('services').select('id').limit(1000);
+      if (!catErr && Array.isArray(catalogIds)) {
+        for (const row of catalogIds) {
+          if (row?.id == null) continue;
+          const k = String(row.id);
+          if (popularityCounts[k] === undefined) popularityCounts[k] = 0;
+        }
+      }
+    } catch (e) {
+      console.warn('Recommendation catalog merge skipped:', e?.message || e);
+    }
+
     // Build co-occurrence matrix at user level (services that co-occur for same user)
     Object.values(bookingsByUser).forEach((serviceList) => {
       const uniqueServices = Array.from(new Set(serviceList));
@@ -189,12 +313,37 @@ router.get('/user/:userId/recommendations', async (req, res) => {
       .sort(([, aCount], [, bCount]) => bCount - aCount)
       .map(([serviceId, count]) => ({ service_id: serviceId, count }));
 
+    // Trend windows: last 14 days of bookings (for ML momentum: recent 7d vs prior 7d)
+    let serviceTrends = {};
+    try {
+      const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+      const { data: trendRows, error: trendErr } = await supabase
+        .from('bookings')
+        .select('service_id, created_at')
+        .neq('booking_status', 'cancelled')
+        .not('service_id', 'is', null)
+        .gte('created_at', fourteenDaysAgo)
+        .order('created_at', { ascending: false })
+        .limit(8000);
+
+      if (!trendErr && trendRows) {
+        serviceTrends = buildServiceTrendsFromRows(trendRows);
+      }
+    } catch (e) {
+      console.warn('Service trend aggregation skipped:', e?.message || e);
+    }
+
+    const maxPop = popularServices.length
+      ? Math.max(...popularServices.map((p) => Number(p.count) || 0), 1)
+      : 1;
+
     const payload = {
       user_id: resolvedUserId,
       current_service_id: currentServiceId,
       user_history: userHistory,
       global_cooccurrence: globalCooccurrence,
       popular_services: popularServices,
+      service_trends: serviceTrends,
       limit: Number.isFinite(limit) && limit > 0 ? limit : 5
     };
 
@@ -213,11 +362,21 @@ router.get('/user/:userId/recommendations', async (req, res) => {
         }));
 
       if (!fallback.length) {
+        const paddedNone = await backfillRecommendationsEnriched(
+          supabase,
+          [],
+          payload.limit,
+          popularServices,
+          usedSet,
+          serviceTrends,
+          maxPop
+        );
         return res.json({
           userId,
           currentServiceId,
-          recommendations: [],
-          usedMlService: false
+          recommendations: paddedNone,
+          usedMlService: false,
+          trendSignalAvailable: Object.keys(serviceTrends).length > 0
         });
       }
 
@@ -234,9 +393,13 @@ router.get('/user/:userId/recommendations', async (req, res) => {
 
       const recommendations = fallback.map((r) => {
         const s = serviceById[r.service_id] || {};
+        const ins = fallbackInsight(r.service_id, serviceTrends, Number(r.score) || 0, maxPop);
         return {
           serviceId: r.service_id,
           score: r.score,
+          insightKey: ins.insightKey,
+          insightLabel: ins.insightLabel,
+          scoreComponents: null,
           name: s.name || '',
           description: s.description || '',
           icon_url: s.icon_url || null,
@@ -248,21 +411,45 @@ router.get('/user/:userId/recommendations', async (req, res) => {
         };
       });
 
+      const excludeSet = new Set(userHistory.map(String));
+      const padded = await backfillRecommendationsEnriched(
+        supabase,
+        recommendations,
+        payload.limit,
+        popularServices,
+        excludeSet,
+        serviceTrends,
+        maxPop
+      );
+
       return res.json({
         userId,
         currentServiceId,
-        recommendations,
-        usedMlService: false
+        recommendations: padded,
+        usedMlService: false,
+        trendSignalAvailable: Object.keys(serviceTrends).length > 0
       });
     }
 
     const recommendedList = mlData.recommendations || [];
+    const excludeSet = new Set(userHistory.map(String));
+
     if (!recommendedList.length) {
+      const paddedEmpty = await backfillRecommendationsEnriched(
+        supabase,
+        [],
+        payload.limit,
+        popularServices,
+        excludeSet,
+        serviceTrends,
+        maxPop
+      );
       return res.json({
         userId,
         currentServiceId,
-        recommendations: [],
-        usedMlService: true
+        recommendations: paddedEmpty,
+        usedMlService: true,
+        trendSignalAvailable: Object.keys(serviceTrends).length > 0
       });
     }
 
@@ -277,11 +464,14 @@ router.get('/user/:userId/recommendations', async (req, res) => {
       serviceById[s.id] = s;
     });
 
-    const recommendations = recommendedList.map((r) => {
+    let recommendations = recommendedList.map((r) => {
       const s = serviceById[r.service_id] || {};
       return {
         serviceId: r.service_id,
         score: r.score,
+        insightKey: r.insight_key || null,
+        insightLabel: r.insight_label || null,
+        scoreComponents: r.components || null,
         name: s.name || '',
         description: s.description || '',
         icon_url: s.icon_url || null,
@@ -293,11 +483,22 @@ router.get('/user/:userId/recommendations', async (req, res) => {
       };
     });
 
+    recommendations = await backfillRecommendationsEnriched(
+      supabase,
+      recommendations,
+      payload.limit,
+      popularServices,
+      excludeSet,
+      serviceTrends,
+      maxPop
+    );
+
     return res.json({
       userId,
       currentServiceId,
       recommendations,
-      usedMlService: true
+      usedMlService: true,
+      trendSignalAvailable: Object.keys(serviceTrends).length > 0
     });
   } catch (error) {
     console.error('Get service recommendations error:', error);
