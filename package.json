@@ -8,8 +8,10 @@
     "express": "^5.1.0",
     "form-data": "^4.0.4",
     "multer": "^2.0.2",
+    "node-cron": "^3.0.3",
     "node-fetch": "^3.3.2",
     "nord": "^0.2.1",
+    "pg": "^8.20.0",
     "razorpay": "^2.9.5",
     "tesseract.js": "^6.0.1",
     "twilio": "^5.9.0"
@@ -23,7 +25,11 @@
     "dev": "nodemon index.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "run-sql": "node scripts/run-sql.js",
-    "create-test-table": "node scripts/run-sql.js create-test-table-manual.sql"
+    "create-test-table": "node scripts/run-sql.js create-test-table-manual.sql",
+    "refresh-seasonal-scores": "node scripts/refresh-service-seasonal-scores.js",
+    "refresh-season-profiles": "node scripts/refresh-service-season-profiles.js",
+    "setup:seasonal-table": "node scripts/create-seasonal-scores-table.js",
+    "mcp:create-seasonal-table": "node scripts/create-seasonal-scores-table.js"
   },
   "keywords": [],
   "author": "",

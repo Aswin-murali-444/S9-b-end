@@ -1,4 +1,9 @@
 require('dotenv').config();
+if (!process.env.SUPABASE_SERVICE_ROLE_KEY && !process.env.SUPABASE_SERVICE_ROLE) {
+  console.warn(
+    '[S9-b-end] SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SERVICE_ROLE) is not set — client may use anon key; recommendations can return very few rows due to RLS on services.'
+  );
+}
 const express = require('express');
 const cors = require('cors');
 const { supabase } = require('./lib/supabase');
@@ -18,6 +23,7 @@ const notificationsRouter = require('./routes/notifications');
 const reviewsRouter = require('./routes/reviews');
 const adminRouter = require('./routes/admin');
 const contactRouter = require('./routes/contact');
+const { scheduleSeasonalScoresCron } = require('./jobs/scheduleSeasonalScores');
 
 // Import middleware modules
 const { getSystemMetrics } = require('./middleware/systemMetrics');
@@ -125,13 +131,24 @@ app.get('/', (req, res) => {
   });
 });
 
-// Health check endpoint
+// Health check endpoint (use on hosted URL to verify deploy + Supabase config)
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
+  res.json({
+    status: 'healthy',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    memory: process.memoryUsage()
+    memory: process.memoryUsage(),
+    /** If false, recommendations often return 1 item (RLS + anon key). */
+    supabaseServiceRoleConfigured: Boolean(
+      (process.env.SUPABASE_SERVICE_ROLE_KEY && String(process.env.SUPABASE_SERVICE_ROLE_KEY).trim()) ||
+        (process.env.SUPABASE_SERVICE_ROLE && String(process.env.SUPABASE_SERVICE_ROLE).trim())
+    ),
+    /** Git SHA from host (Render/Railway/Vercel) — compare with GitHub latest commit. */
+    deployCommit:
+      process.env.RENDER_GIT_COMMIT ||
+      process.env.RAILWAY_GIT_COMMIT_SHA ||
+      process.env.VERCEL_GIT_COMMIT_SHA ||
+      null
   });
 });
 
@@ -234,4 +251,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
   console.log(`🔗 API Base: http://localhost:${PORT}/api`);
+  scheduleSeasonalScoresCron();
 }); 

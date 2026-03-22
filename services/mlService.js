@@ -1,12 +1,22 @@
 const axios = require('axios');
 
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'http://localhost:5000';
+const ML_RECOMMEND_TIMEOUT_MS = parseInt(
+  process.env.ML_SERVICE_TIMEOUT_MS || process.env.ML_RECOMMEND_TIMEOUT_MS || '15000',
+  10
+);
 
-async function callMlService(path, payload) {
+async function callMlService(path, payload, { timeoutMs } = {}) {
   const url = `${ML_SERVICE_URL.replace(/\/+$/, '')}${path}`;
+  const timeout =
+    timeoutMs != null
+      ? timeoutMs
+      : path.includes('recommend-services')
+        ? Math.max(4000, ML_RECOMMEND_TIMEOUT_MS)
+        : 4000;
   try {
     const response = await axios.post(url, payload, {
-      timeout: 4000,
+      timeout,
       headers: {
         'Content-Type': 'application/json'
       }
